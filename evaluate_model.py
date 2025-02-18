@@ -315,65 +315,97 @@ class ModelEvaluator:
 
     def _generate_enhanced_plots(self, data, results, large_move_analysis):
         """Generate enhanced evaluation plots"""
-        # Create output directory
         output_dir = "evaluation_plots"
         os.makedirs(output_dir, exist_ok=True)
         
-        # 1. Hourly extreme class accuracy
-        plt.figure(figsize=(10, 6))
-        # ... [plotting code for hourly accuracy] ...
-        plt.savefig(f"{output_dir}/01_hourly_extreme_accuracy.png")
+        # 1. Confusion Matrix Heatmap
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(results['ConfusionMatrix'], 
+                    annot=True, 
+                    fmt='d',
+                    cmap='YlOrRd',
+                    xticklabels=['Sharp Drop', 'Mild Drop', 'Neutral', 'Mild Rise', 'Sharp Rise'],
+                    yticklabels=['Sharp Drop', 'Mild Drop', 'Neutral', 'Mild Rise', 'Sharp Rise'])
+        plt.title('Confusion Matrix')
+        plt.tight_layout()
+        plt.savefig(f"{output_dir}/01_confusion_matrix.png")
         plt.close()
 
-        # 2. Cumulative returns
+        # 2. Class Distribution
         plt.figure(figsize=(10, 6))
-        # ... [plotting code for cumulative returns] ...
-        plt.savefig(f"{output_dir}/02_cumulative_returns.png")
+        class_counts = pd.Series(results['Actuals']).value_counts().sort_index()
+        sns.barplot(x=class_counts.index, y=class_counts.values)
+        plt.title('Class Distribution')
+        plt.xlabel('Class')
+        plt.ylabel('Count')
+        plt.xticks(range(5), ['Sharp Drop', 'Mild Drop', 'Neutral', 'Mild Rise', 'Sharp Rise'])
+        plt.tight_layout()
+        plt.savefig(f"{output_dir}/02_class_distribution.png")
         plt.close()
 
-        # 3. Prediction error distribution
+        # 3. Prediction Confidence Distribution
         plt.figure(figsize=(10, 6))
-        # ... [plotting code for error distribution] ...
-        plt.savefig(f"{output_dir}/03_error_distribution.png")
+        max_probs = np.max(results['Predictions'], axis=1)
+        sns.histplot(max_probs, bins=50)
+        plt.title('Prediction Confidence Distribution')
+        plt.xlabel('Maximum Probability')
+        plt.ylabel('Count')
+        plt.tight_layout()
+        plt.savefig(f"{output_dir}/03_prediction_confidence.png")
         plt.close()
 
-        # 4. Trading session accuracy
+        # 4. Class Accuracies
         plt.figure(figsize=(10, 6))
-        # ... [plotting code for session accuracy] ...
-        plt.savefig(f"{output_dir}/04_session_accuracy.png")
+        accuracies = pd.Series(results['ClassAccuracies'])
+        sns.barplot(x=accuracies.index, y=accuracies.values)
+        plt.title('Accuracy by Class')
+        plt.xlabel('Class')
+        plt.ylabel('Accuracy')
+        plt.xticks(range(5), ['Sharp Drop', 'Mild Drop', 'Neutral', 'Mild Rise', 'Sharp Rise'])
+        plt.tight_layout()
+        plt.savefig(f"{output_dir}/04_class_accuracies.png")
         plt.close()
 
-        # 5. Rolling Sharpe ratio
-        plt.figure(figsize=(10, 6))
-        # ... [plotting code for Sharpe ratio] ...
-        plt.savefig(f"{output_dir}/05_rolling_sharpe.png")
-        plt.close()
-
-        # 6. Feature importance
-        plt.figure(figsize=(10, 6))
-        # ... [plotting code for feature importance] ...
-        plt.savefig(f"{output_dir}/06_feature_importance.png")
-        plt.close()
-
-        # 7. Direction confusion matrix
-        plt.figure(figsize=(10, 6))
-        # ... [plotting code for confusion matrix] ...
-        plt.savefig(f"{output_dir}/07_direction_confusion.png")
-        plt.close()
-
-        # 8. Drawdown analysis
-        plt.figure(figsize=(10, 6))
-        # ... [plotting code for drawdown] ...
-        plt.savefig(f"{output_dir}/08_drawdown_analysis.png")
-        plt.close()
-
-        # 9. Returns distribution
-        plt.figure(figsize=(10, 6))
-        # ... [plotting code for returns distribution] ...
-        plt.savefig(f"{output_dir}/09_returns_distribution.png")
-        plt.close()
+        # 5. Volatility Analysis
+        self._generate_volatility_analysis(data, results, output_dir)
 
         logger.info(f"All evaluation plots saved to {output_dir}/ directory")
+
+    def _generate_volatility_analysis(self, data, results, output_dir):
+        """分析不同波动率水平下的预测表现"""
+        # 计算滚动波动率
+        volatility = data['mid_price'].pct_change().rolling(window=120).std()
+        volatility_quantiles = pd.qcut(volatility, q=5, labels=['Very Low', 'Low', 'Medium', 'High', 'Very High'])
+        
+        # 计算每个波动率区间的预测准确率
+        y_pred = np.argmax(results['Predictions'], axis=1)
+        accuracies = []
+        for label in volatility_quantiles.unique():
+            mask = volatility_quantiles == label
+            acc = (y_pred[mask] == results['Actuals'][mask]).mean()
+            accuracies.append({'Volatility': label, 'Accuracy': acc})
+        
+        # 绘制波动率分析图
+        plt.figure(figsize=(12, 6))
+        acc_df = pd.DataFrame(accuracies)
+        sns.barplot(data=acc_df, x='Volatility', y='Accuracy')
+        plt.title('Prediction Accuracy by Volatility Level')
+        plt.xlabel('Volatility Level')
+        plt.ylabel('Accuracy')
+        plt.tight_layout()
+        plt.savefig(f"{output_dir}/05_volatility_analysis.png")
+        plt.close()
+        
+        # 波动率与预测置信度的关系
+        plt.figure(figsize=(12, 6))
+        confidence = np.max(results['Predictions'], axis=1)
+        plt.scatter(volatility, confidence, alpha=0.5)
+        plt.title('Prediction Confidence vs Volatility')
+        plt.xlabel('Volatility')
+        plt.ylabel('Prediction Confidence')
+        plt.tight_layout()
+        plt.savefig(f"{output_dir}/06_volatility_confidence.png")
+        plt.close()
 
     def _generate_large_move_analysis(self, results):
         """Generate large move analysis plots"""
