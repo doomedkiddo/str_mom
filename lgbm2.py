@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, TimeSeriesSplit
 from sklearn.metrics import mean_squared_error, f1_score
 from loguru import logger
 import psutil
@@ -10,6 +10,7 @@ from datetime import timedelta
 from scipy.fft import fft
 from sklearn.preprocessing import RobustScaler
 from sklearn.decomposition import IncrementalPCA
+import pyarrow.feather as ft
 
 def log_memory_usage():
     """Log current memory usage"""
@@ -17,12 +18,18 @@ def log_memory_usage():
     memory_info = process.memory_info()
     logger.info(f"Memory usage: {memory_info.rss / 1024 / 1024:.2f} MB")
 
-def stream_csv_chunks(filename, chunksize=100000):
-    """Stream CSV file in chunks"""
-    return pd.read_csv(filename, chunksize=chunksize)
+def stream_feather_chunks(filename, chunksize=100000):
+    """流式读取Feather文件（修正版）"""
+    table = ft.read_table(filename)
+    total_rows = table.num_rows
+    
+    for start in range(0, total_rows, chunksize):
+        end = min(start + chunksize, total_rows)
+        # 使用pyarrow的slice方法分块
+        yield table.slice(start, end - start).to_pandas()
 
 def process_chunk(chunk):
-    """增强版数据预处理，与 hft_pipeline 对应"""
+    """增强的数据预处理"""
     logger.info(f"开始处理数据块，原始数据大小：{chunk.shape}")
     chunk = chunk.copy()
     
@@ -47,50 +54,97 @@ def process_chunk(chunk):
                  if col not in keep_float64]
     chunk[float_cols] = chunk[float_cols].astype(np.float32)
     
-    # 修改特征保留列表，保留mid_price但不作为训练特征
+    # 修改特征保留列表，添加自动生成的特征
     features_to_keep = [
         'mid_price',  # 保留mid_price用于后续计算
         'relative_spread', 'depth_imbalance',
-        'bid_ask_slope', 'order_book_pressure', 'weighted_price_depth',
-        'liquidity_imbalance', 'flow_toxicity', 'price_momentum',
+        'bid_ask_slope', 'order_book_pressure',
+        'flow_toxicity', 'price_momentum',
         'volatility_ratio', 'ofi', 'vpin', 'pressure_change_rate',
-        'orderbook_gradient', 'depth_pressure_ratio'
+        'orderbook_gradient', 'depth_pressure_ratio',
+        'weighted_price_depth',  # 添加自动生成的特征
+        'liquidity_imbalance'     # 添加自动生成的特征
     ]
+    
+    # 修改特征生成逻辑，增加更多错误处理和验证
+    logger.info("开始生成特征...")
+    
+    # 生成 weighted_price_depth
+    try:
+        if 'weighted_price_depth' not in chunk.columns:
+            logger.warning("自动生成weighted_price_depth特征")
+            bid_depth = chunk.get('bid_depth', pd.Series(0, index=chunk.index))
+            ask_depth = chunk.get('ask_depth', pd.Series(0, index=chunk.index))
+            chunk['weighted_price_depth'] = (bid_depth + ask_depth) * 0.5
+            logger.info(f"weighted_price_depth统计: \n{chunk['weighted_price_depth'].describe()}")
+    except Exception as e:
+        logger.error(f"生成weighted_price_depth时出错: {str(e)}")
+        # 使用默认值
+        chunk['weighted_price_depth'] = pd.Series(1.0, index=chunk.index)
+    
+    # 生成 liquidity_imbalance
+    try:
+        if 'liquidity_imbalance' not in chunk.columns:
+            logger.warning("自动生成liquidity_imbalance特征")
+            bid_volume = chunk.get('bid_volume', pd.Series(0, index=chunk.index))
+            ask_volume = chunk.get('ask_volume', pd.Series(0, index=chunk.index))
+            chunk['liquidity_imbalance'] = bid_volume - ask_volume
+            logger.info(f"liquidity_imbalance统计: \n{chunk['liquidity_imbalance'].describe()}")
+    except Exception as e:
+        logger.error(f"生成liquidity_imbalance时出错: {str(e)}")
+        # 使用默认值
+        chunk['liquidity_imbalance'] = pd.Series(0.0, index=chunk.index)
+    
+    # 验证特征是否成功生成
+    logger.info("验证特征生成结果...")
+    for feature in ['weighted_price_depth', 'liquidity_imbalance']:
+        if feature not in chunk.columns:
+            logger.error(f"特征 {feature} 生成失败")
+            raise ValueError(f"无法生成特征: {feature}")
+        if chunk[feature].isna().any():
+            logger.warning(f"特征 {feature} 包含缺失值，进行填充")
+            chunk[feature] = chunk[feature].fillna(0)
     
     # 确保所有保留的特征都存在
     missing_features = [f for f in features_to_keep if f not in chunk.columns]
     if missing_features:
         logger.error(f"缺失必要特征: {missing_features}")
-        # 添加调试信息
         logger.info(f"当前可用列: {chunk.columns.tolist()}")
         raise ValueError(f"数据中缺失必要特征: {missing_features}")
     
-    # 异常值处理
-    for col in features_to_keep:
-        if col in chunk.columns:
-            q1 = chunk[col].quantile(0.01)
-            q3 = chunk[col].quantile(0.99)
-            chunk[col] = np.clip(chunk[col], q1, q3)
+    # 在返回数据之前进行最后的验证
+    final_features = chunk[features_to_keep].columns
+    logger.info(f"最终特征列表: {final_features.tolist()}")
     
-    chunk = chunk[features_to_keep].ffill().bfill().fillna(0)
+    # 确保返回的数据包含所有必要的特征
+    result = chunk[features_to_keep].copy()
+    logger.info(f"处理后的数据形状: {result.shape}")
+    logger.info(f"处理后的特征列表: {result.columns.tolist()}")
     
-    # 特征分布检查
-    logger.info("特征分布检查:")
-    for col in features_to_keep:
-        stats = chunk[col].describe()
-        logger.info(f"{col} 统计:\n{stats}")    
-        zero_percent = (chunk[col] == 0).mean() * 100
-        if zero_percent > 90:
-            logger.warning(f"高零值警告: {col} 有 {zero_percent:.2f}% 的零值!")
-    
-    return chunk
+    return result
 
 def create_features(data_chunk, window_size=1800):
-    """增强版特征工程，改为五分类预测"""
+    """增强版特征工程"""
     logger.info("开始特征工程...")
     data_chunk = data_chunk.copy()
     
-    # 计算目标变量 - 改为五分类
+    # 保存一个mid_price的副本用于后续特征计算
+    mid_price_copy = data_chunk['mid_price'].copy()
+    
+    # 确保索引是时间类型
+    if not isinstance(data_chunk.index, pd.DatetimeIndex):
+        logger.warning("索引不是时间类型，尝试转换...")
+        try:
+            data_chunk.index = pd.to_datetime(data_chunk.index)
+        except Exception as e:
+            logger.error(f"时间索引转换失败: {str(e)}，创建新时间索引")
+            data_chunk.index = pd.date_range(
+                start='2024-01-01', 
+                periods=len(data_chunk), 
+                freq='500ms'
+            )
+    
+    # 计算目标变量 - 改为三分类
     prediction_points = 120  # 60秒 = 120个500ms间隔
     if 'mid_price' not in data_chunk.columns:
         logger.error("缺少mid_price列，无法计算目标变量！")
@@ -100,39 +154,33 @@ def create_features(data_chunk, window_size=1800):
     data_chunk['price_change_rate'] = (data_chunk['mid_price'].shift(-prediction_points) - 
                                       data_chunk['mid_price']) / data_chunk['mid_price']
     
-    # 改进分类边界定义，增加中间类别的区分度
-    thresholds = [-0.0004, -0.0002, 0.0002, 0.0004]
-    buffer_zone = 0.00005  # 增加缓冲区
-    
+    # 固定阈值定义
+    LOWER_THRESHOLD = -0.0005  # -0.05%
+    UPPER_THRESHOLD = 0.0005   # +0.05%
+
     conditions = [
-        (data_chunk['price_change_rate'] <= thresholds[0] - buffer_zone),
-        (data_chunk['price_change_rate'] > thresholds[0] - buffer_zone) & 
-        (data_chunk['price_change_rate'] <= thresholds[1] + buffer_zone),
-        (data_chunk['price_change_rate'] > thresholds[1] + buffer_zone) & 
-        (data_chunk['price_change_rate'] < thresholds[2] - buffer_zone),
-        (data_chunk['price_change_rate'] >= thresholds[2] - buffer_zone) & 
-        (data_chunk['price_change_rate'] < thresholds[3] + buffer_zone),
-        (data_chunk['price_change_rate'] >= thresholds[3] + buffer_zone)
+        (data_chunk['price_change_rate'] < LOWER_THRESHOLD),
+        (data_chunk['price_change_rate'].between(LOWER_THRESHOLD, UPPER_THRESHOLD)),
+        (data_chunk['price_change_rate'] > UPPER_THRESHOLD)
     ]
+    values = [0, 1, 2]
     
-    # 添加目标类别赋值
-    data_chunk['target_class'] = np.select(conditions, [0, 1, 2, 3, 4])
+    # 目标类别赋值
+    data_chunk['target_class'] = np.select(conditions, values, default=1)
     
-    # 添加动态类别合并（当某类样本过少时）
-    class_counts = data_chunk['target_class'].value_counts()
-    min_samples = len(data_chunk) * 0.1  # 至少10%样本
+    # 添加滞后特征防止未来信息泄露（在删除列之前）
+    data_chunk['price_change_lag1'] = data_chunk['price_change_rate'].shift(1)
+    data_chunk['order_flow_lag2'] = data_chunk['flow_toxicity'].shift(2)
     
-    if any(class_counts < min_samples):
-        logger.warning("检测到类别不平衡，执行动态合并...")
-        # 合并小类到相邻类别
-        for cls in class_counts[class_counts < min_samples].index:
-            if cls == 1:  # 小跌合并到震荡
-                data_chunk['target_class'] = np.where(data_chunk['target_class'] == 1, 2, data_chunk['target_class'])
-            elif cls == 3:  # 小涨合并到震荡
-                data_chunk['target_class'] = np.where(data_chunk['target_class'] == 3, 2, data_chunk['target_class'])
-    
-    # 移除中间计算列和原始mid_price
+    # 移除中间计算列和原始mid_price（现在保留price_change_rate用于创建滞后特征）
     data_chunk = data_chunk.drop(columns=['price_change_rate', 'mid_price'])
+    
+    # 目标类别赋值后添加分布统计
+    class_dist = pd.value_counts(data_chunk['target_class'])
+    logger.info("\n=== 镜像后目标分布 ===")
+    logger.info(f"下跌 (0): {class_dist.get(0, 0)} ({class_dist.get(0, 0)/len(data_chunk):.2%})")
+    logger.info(f"平稳 (1): {class_dist.get(1, 0)} ({class_dist.get(1, 0)/len(data_chunk):.2%})")
+    logger.info(f"上涨 (2): {class_dist.get(2, 0)} ({class_dist.get(2, 0)/len(data_chunk):.2%})")
     
     # 基础特征列表
     base_features = [
@@ -169,14 +217,110 @@ def create_features(data_chunk, window_size=1800):
     # 数据验证
     if data_chunk['target_class'].isna().any():
         logger.warning("目标变量包含NaN值，进行填充")
-        data_chunk['target_class'] = data_chunk['target_class'].fillna(2)
+        data_chunk['target_class'] = data_chunk['target_class'].fillna(1)
     
     # 特征重要性分析
     correlations = data_chunk.corr()['target_class'].abs().sort_values(ascending=False)
     logger.info("\n特征与目标变量的相关性:")
     logger.info(correlations.head(10))
     
-    return data_chunk
+    # 在目标变量创建后添加镜像样本生成
+    logger.info("生成镜像样本...")
+    original_samples = data_chunk.copy()
+    
+    # 筛选需要镜像的样本（仅下跌和上涨类别）
+    mirror_mask = (data_chunk['target_class'] == 0) | (data_chunk['target_class'] == 2)
+    mirror_samples = data_chunk[mirror_mask].copy()
+    
+    # 定义需要反转的特征（根据特征含义调整）
+    inverse_features = {
+        'depth_imbalance': True,
+        'bid_ask_slope': True,
+        'order_book_pressure': True,
+        'liquidity_imbalance': True,
+        'pressure_change_rate': True,
+        'market_state': False  # 不反转市场状态
+    }
+    
+    for col, should_invert in inverse_features.items():
+        if should_invert and col in mirror_samples.columns:
+            mirror_samples[col] = -mirror_samples[col]
+    
+    # 添加随机噪声增强
+    noise_scale = 0.01 * mirror_samples.std()
+    for col in mirror_samples.columns:
+        if col not in ['target_class', 'market_state']:
+            mirror_samples[col] += np.random.normal(0, noise_scale[col], size=len(mirror_samples))
+    
+    # 合并原始样本和镜像样本
+    balanced_chunk = pd.concat([original_samples, mirror_samples], axis=0)
+    
+    # 打乱数据顺序但保持时间连续性
+    balanced_chunk = balanced_chunk.sample(frac=1.0, random_state=42).sort_index()
+    
+    # 添加时间连续性检查（增强容错性）
+    try:
+        time_diff = balanced_chunk.index.to_series().diff().dt.total_seconds()
+        if np.isclose(time_diff[1:], 0.5, atol=0.1).any():  # 允许±100ms的误差
+            logger.warning("数据时间间隔异常，存在缺失或重复")
+    except AttributeError as e:
+        logger.error(f"时间索引异常: {str(e)}")
+        logger.info(f"当前索引类型: {type(balanced_chunk.index)}")
+        logger.info("尝试重建时间索引...")
+        balanced_chunk.index = pd.date_range(
+            start=balanced_chunk.index[0],
+            periods=len(balanced_chunk),
+            freq='500ms'
+        )
+    
+    logger.info(f"镜像后数据量: {len(balanced_chunk)} (原始: {len(data_chunk)})")
+    
+    # 修改这部分代码，使用保存的mid_price副本
+    # 添加新的价格动量特征
+    data_chunk['price_momentum_1min'] = data_chunk['price_momentum'].rolling(120).mean()  # 1分钟
+    data_chunk['price_momentum_5min'] = data_chunk['price_momentum'].rolling(600).mean()  # 5分钟
+    
+    # 添加波动率特征 - 使用保存的mid_price副本
+    data_chunk['volatility_1min'] = mid_price_copy.rolling(120).std()
+    data_chunk['volatility_5min'] = mid_price_copy.rolling(600).std()
+    
+    # 添加交易量压力特征
+    data_chunk['volume_pressure'] = (data_chunk['ofi'].rolling(120).sum() / 
+                                   data_chunk['vpin'].rolling(120).mean())
+    
+    # 添加趋势特征
+    data_chunk['trend_strength'] = (data_chunk['price_momentum_5min'] / 
+                                  data_chunk['volatility_5min'])
+    
+    # 添加市场微观结构特征
+    data_chunk['spread_volatility'] = data_chunk['relative_spread'].rolling(120).std()
+    data_chunk['depth_volatility'] = data_chunk['depth_imbalance'].rolling(120).std()
+    
+    # 添加交叉特征
+    data_chunk['pressure_momentum'] = (data_chunk['order_book_pressure'] * 
+                                     data_chunk['price_momentum'])
+    
+    # 添加新的市场微观结构特征
+    data_chunk['depth_velocity'] = data_chunk['depth_imbalance'].diff() / data_chunk['depth_imbalance'].abs().rolling(60).mean()
+    data_chunk['pressure_gradient'] = data_chunk['order_book_pressure'].rolling(120).apply(lambda x: np.polyfit(range(len(x)), x, 1)[0])
+    data_chunk['spread_acceleration'] = data_chunk['relative_spread'].diff().diff()
+    
+    # 添加买卖压力特征
+    data_chunk['bid_ask_pressure_ratio'] = (data_chunk['order_book_pressure'].rolling(60).max() / 
+                                          data_chunk['order_book_pressure'].rolling(60).min())
+    
+    # 添加流动性特征
+    data_chunk['liquidity_velocity'] = (data_chunk['liquidity_imbalance'].diff() / 
+                                      data_chunk['liquidity_imbalance'].abs().rolling(60).mean())
+    
+    # 添加高频交易特征
+    data_chunk['hft_pressure'] = (data_chunk['flow_toxicity'].rolling(30).std() * 
+                                data_chunk['ofi'].rolling(30).mean())
+    
+    # 最后删除mid_price副本
+    del mid_price_copy
+    
+    return balanced_chunk
 
 def calculate_market_state(data_chunk):
     """计算市场状态（增强稳定性）"""
@@ -195,280 +339,149 @@ def calculate_market_state(data_chunk):
         logger.error(f"市场状态计算失败: {str(e)}")
         return np.zeros(len(data_chunk))
 
-def train_enhanced_model(data, config):
-    """增强版模型训练 - 改为五分类"""
-    if data is None or data.empty:
-        logger.error("输入数据为空！")
-        return [], []
-    
-    logger.info("开始模型训练...")
-    logger.info(f"数据集大小：{data.shape}")
-    
-    # 确保mid_price不会被用作训练特征
-    training_features = [col for col in data.columns 
-                        if col not in ['mid_price', 'target_class']]
-    
-    # 验证所有必需特征都存在
-    required_features = [
-        'relative_spread', 'depth_imbalance',
-        'bid_ask_slope', 'order_book_pressure', 'weighted_price_depth',
-        'liquidity_imbalance', 'flow_toxicity', 'price_momentum',
-        'volatility_ratio', 'ofi', 'vpin', 'pressure_change_rate',
-        'orderbook_gradient', 'depth_pressure_ratio'
-    ]
-    
-    missing_features = [f for f in required_features if f not in training_features]
-    if missing_features:
-        logger.error(f"缺失必需特征: {missing_features}")
-        return [], []
-    
-    logger.info("开始模型训练...")
-    logger.info(f"数据集大小：{data.shape}")
-    
-    logger.info("创建内存映射文件...")
-    try:
-        # 重置索引并移除时间列
-        data = data.reset_index(drop=True)
-        
-        # 确保只保留数值型特征
-        numeric_data = data[training_features + ['target_class']].select_dtypes(include=[np.number])
-        
-        X = np.memmap('X.dat', dtype=np.float32, mode='w+', 
-                      shape=(len(numeric_data), len(training_features)))
-        y = np.memmap('y.dat', dtype=np.float32, mode='w+', shape=(len(numeric_data),))
-        
-        logger.info("填充训练数据...")
-        X[:] = numeric_data[training_features].values
-        y[:] = numeric_data['target_class'].values
-    except Exception as e:
-        logger.error(f"内存映射失败：{str(e)}")
-        return [], []
-    
-    logger.info("配置训练参数...")
-    # Use is_unbalance or manually adjust weights in the dataset
+def train_enhanced_model(data, model=None):
+    """改进的模型训练"""
     params = {
         'boosting_type': 'goss',
         'objective': 'multiclass',
-        'num_class': 5,
-        'metric': ['multi_logloss', 'multi_error'],  # 添加多分类错误率
-        'num_leaves': 63,  # 减少叶子节点防止过拟合
-        'learning_rate': 0.03,  # 降低学习率
-        'feature_fraction': 0.7,  # 增加特征采样比例
-        'min_data_in_leaf': 200,  # 增加叶子节点最小数据量
-        'max_depth': 6,  # 限制树深
-        'verbosity': -1,
-        'device': 'gpu',
-        'gpu_platform_id': 0,
-        'gpu_device_id': 0,
-        'max_bin': 255,
-        'num_iterations': 5000,
-        'early_stopping_round': 50,
-        'lambda_l1': 1.0,
-        'lambda_l2': 1.0,
-        'num_threads': 0,
-        'gpu_use_dp': True,
-        'is_unbalance': True  # Use this for handling class imbalance
+        'num_class': 3,
+        'metric': ['multi_logloss', 'multi_error'],
+        'num_leaves': 27,
+        'learning_rate': 0.003,
+        'feature_fraction': 0.6,
+        'min_data_in_leaf': 100,
+        'max_depth': 7,
+        'lambda_l1': 0.2,
+        'lambda_l2': 0.2,
+        'min_gain_to_split': 0.1,
+        'path_smooth': 0.5,
+        'max_bin': 127,
+        'device': 'gpu'
     }
     
-    logger.info("开始时间序列交叉验证...")
-    n_splits = 5
-    fold_size = len(data) // n_splits
+    # 添加动态学习率衰减
+    callbacks = [
+        lgb.reset_parameter(
+            learning_rate=lambda epoch: params['learning_rate'] * (0.98 ** epoch)
+        ),
+        lgb.early_stopping(50, verbose=10),
+        lgb.log_evaluation(50)
+    ]
     
-    # 添加分割有效性检查
-    if fold_size == 0:
-        logger.error("数据量不足以进行交叉验证！")
-        return [], []
+    # 创建存储特征重要性的列表
+    feature_importances = []
     
-    metrics = []
-    models = []
+    # 定义特征重要性追踪回调
+    def save_feature_importance(env):
+        importance = pd.DataFrame({
+            'feature': env.model.feature_name(),
+            'importance': env.model.feature_importance()
+        })
+        feature_importances.append(importance)
     
-    for i in range(n_splits-1):
-        logger.info(f"\n开始训练第 {i+1} 折...")
-        train_start = i * fold_size
-        train_end = (i+2) * fold_size
-        val_start = train_end
-        val_end = val_start + fold_size
+    callbacks.append(save_feature_importance)
+    
+    # 特征选择
+    feature_importance = pd.DataFrame()
+    if model is not None:
+        feature_importance = pd.DataFrame({
+            'feature': feature_cols,
+            'importance': model.feature_importance()
+        })
+        # 只保留重要性前80%的特征
+        threshold = feature_importance['importance'].quantile(0.2)
+        selected_features = feature_importance[
+            feature_importance['importance'] > threshold
+        ]['feature'].tolist()
+        X = data[selected_features].values
+    
+    # 准备特征和目标变量
+    excluded_columns = ['target_class', 'mid_price', 'price_change_rate']
+    feature_cols = [col for col in data.columns if col not in excluded_columns]
+    
+    X = data[feature_cols].values
+    y = data['target_class'].values
+    
+    if model is None:
+        # 初始训练时分割训练集和验证集
+        split_idx = int(0.8 * len(X))
+        X_train, X_val = X[:split_idx], X[split_idx:]
+        y_train, y_val = y[:split_idx], y[split_idx:]
         
-        # 确保索引不越界
-        train_end = min(train_end, len(data))
-        val_start = min(val_start, len(data))
-        val_end = min(val_end, len(data))
+        # 计算样本权重
+        weights_train = compute_sample_weights(y_train)
         
-        # 检查训练集和验证集大小
-        if train_end - train_start < 100:
-            logger.warning(f"第 {i+1} 折训练数据不足，跳过")
-            continue
-            
-        if val_end - val_start < 10:
-            logger.warning(f"第 {i+1} 折验证数据不足，跳过")
-            continue
+        train_set = lgb.Dataset(
+            X_train, y_train,
+            weight=weights_train,
+            feature_name=feature_cols,
+            free_raw_data=False
+        )
+        valid_set = lgb.Dataset(
+            X_val, y_val,
+            feature_name=feature_cols,
+            free_raw_data=False
+        )
         
-        logger.info(f"训练集大小：{train_end-train_start}，验证集大小：{val_end-val_start}")
-        
-        X_train = X[train_start:train_end]
-        y_train = y[train_start:train_end]
-        X_val = X[val_start:val_end]
-        y_val = y[val_start:val_end]
-        
-        logger.info("创建训练集和验证集...")
-        # Manually adjust weights in the dataset
-        class_weights = data['target_class'].value_counts(normalize=True).sort_index().to_dict()
-        weights = np.array([1/class_weights[c] for c in y_train])
-        
-        train_set = lgb.Dataset(X_train, y_train, 
-                               weight=weights,  # 样本权重
-                               free_raw_data=False)
-        
-        # Initialize val_set here
-        val_set = lgb.Dataset(X_val, y_val, reference=train_set, free_raw_data=False)
-                               
-        # 添加自定义评估指标
-        def multi_class_f1(preds, train_data):
-            labels = train_data.get_label()
-            preds = preds.reshape(5, -1).T.argmax(axis=1)
-            f1 = f1_score(labels, preds, average='macro')
-            return 'macro_f1', f1, True
-        
+        # 初始训练
         model = lgb.train(
             params,
             train_set,
-            valid_sets=[val_set],
-            callbacks=[
-                lgb.log_evaluation(100),
-                lgb.early_stopping(50),
-                lgb.reset_parameter(learning_rate=lambda iter: 0.05 * (0.99 ** iter)),
-            ],
-            feval=multi_class_f1  # 添加F1评估
+            num_boost_round=100,
+            valid_sets=[train_set, valid_set],
+            valid_names=['train', 'valid'],
+            callbacks=callbacks
+        )
+    else:
+        # 计算样本权重
+        weights = compute_sample_weights(y)
+        
+        # 增量训练使用全部数据
+        train_set = lgb.Dataset(
+            X, y,
+            weight=weights,
+            feature_name=feature_cols,
+            free_raw_data=False
         )
         
-        # 评估模型时单独计算准确率
-        logger.info("评估模型性能...")
-        y_pred = model.predict(X_val)
-        metrics.append(multi_task_metric(y_pred, y_val))
-        models.append(model)
-        
-        logger.info(f"第 {i+1} 折训练完成")
-        logger.info(f"多分类准确率: {metrics[-1][0][1]:.6f}")
-        logger.info(f"最佳迭代次数: {model.best_iteration}")
-        
-        # 特征重要性分析
-        importance = pd.DataFrame({
-            'feature': model.feature_name(),
-            'importance': model.feature_importance()
-        }).sort_values('importance', ascending=False)
-        logger.info("\n前10个重要特征：")
-        logger.info(importance.head(10))
-        
-        # 特征选择（保留前100个重要特征）
-        selected_features = importance.head(100)['feature'].values
-        
-        # +++ 新增共线性过滤 +++
-        logger.info("执行共线性特征过滤...")
-        try:
-            # 获取特征索引
-            feature_indices = [model.feature_name().index(f) for f in selected_features]
-            
-            # 使用索引从X_train中获取特征数据
-            feature_data = pd.DataFrame(
-                X_train[:, feature_indices],
-                columns=selected_features
-            )
-            
-            corr_matrix = feature_data.corr().abs()
-            
-            # 过滤高相关性特征
-            to_remove = set()
-            for i in range(len(selected_features)):
-                if selected_features[i] in to_remove:
-                    continue
-                for j in range(i+1, len(selected_features)):
-                    if corr_matrix.loc[selected_features[i], selected_features[j]] > 0.8:
-                        to_remove.add(selected_features[j])
-            
-            selected_features = [f for f in selected_features if f not in to_remove]
-            logger.info(f"共线性过滤后保留特征数: {len(selected_features)}")
-            
-            # 记录被移除的特征
-            removed_features = list(to_remove)
-            if removed_features:
-                logger.info(f"被移除的高相关性特征: {removed_features}")
-                
-        except Exception as e:
-            logger.error(f"共线性过滤失败: {str(e)}")
-            logger.error(f"可用的特征名称: {model.feature_name()[:10]}...")  # 打印前10个特征名称作为示例
-            return [], []
-        
-        # 更新特征选择
-        X_train = X_train[:, [model.feature_name().index(f) for f in selected_features]]
-        X_val = X_val[:, [model.feature_name().index(f) for f in selected_features]]
-        
-        # 修改特征选择后的处理
-        logger.info("执行PCA降维...")
-        try:
-            pca = IncrementalPCA(n_components=50, batch_size=1000)
-            
-            # 确保数据没有NaN
-            X_train = np.nan_to_num(X_train, nan=0.0, posinf=1e6, neginf=-1e6)
-            X_val = np.nan_to_num(X_val, nan=0.0, posinf=1e6, neginf=-1e6)
-            
-            pca.fit(X_train)
-            X_train = pca.transform(X_train)
-            X_val = pca.transform(X_val)
-            
-            # 再次检查数据有效性
-            if np.isnan(X_train).any() or np.isinf(X_train).any():
-                logger.error("PCA处理后训练数据仍存在无效值！")
-                return [], []
-            
-        except Exception as e:
-            logger.error(f"PCA处理失败: {str(e)}")
-            return [], []
-        
-        del train_set, val_set
-        gc.collect()
-        logger.info("内存已清理")
+        # 继续训练现有模型
+        model = lgb.train(
+            params,
+            train_set,
+            init_model=model,
+            num_boost_round=50,  # 每次增量训练的轮次
+            valid_sets=[train_set],
+            valid_names=['train'],
+            callbacks=callbacks
+        )
     
-    logger.info("\n训练完成！")
-    logger.info(f"多分类准确率: {np.mean([m[0][1] for m in metrics]):.6f}")
-    logger.info(f"最佳多分类准确率: {min([m[0][1] for m in metrics]):.6f}")
-    logger.info(f"多分类准确率标准差: {np.std([m[0][1] for m in metrics]):.6f}")
-    
-    # 添加数据分布检查
-    logger.info("目标值分布统计:")
-    logger.info(data['target_class'].describe())
-    
-    # 添加特征相关性检查
-    corr_with_target = data.corr()['target_class'].abs().sort_values(ascending=False)
-    logger.info("特征相关性排名:\n" + corr_with_target.head(10).to_string())
-    
-    # 在train_enhanced_model函数中添加调试日志
-    logger.info(f"最终训练特征列表: {data.columns.tolist()}")
-    logger.info(f"mid_price存在状态: {'mid_price' in data.columns}")
-    
-    return models, metrics
+    return model
 
 def multi_task_metric(y_pred, y_true):
-    """自定义评估指标 - 适配多分类"""
-    # 转换预测概率为类别
-    y_pred_class = np.argmax(y_pred.reshape(-1, 5), axis=1)
+    """自定义评估指标 - 适配三分类"""
+    y_pred_class = np.argmax(y_pred.reshape(-1, 3), axis=1)
     
     # 计算准确率
     accuracy = np.mean(y_pred_class == y_true)
     
     # 计算混淆矩阵
-    confusion = np.zeros((5, 5))
+    confusion = np.zeros((3, 3))
     for i in range(len(y_true)):
         confusion[int(y_true[i])][y_pred_class[i]] += 1
     
-    # 计算每个类别的准确率
+    # 计算每个类别的准确率和其他指标
     class_acc = confusion.diagonal() / confusion.sum(axis=1)
+    
+    # 添加更详细的评估指标
+    f1_scores = f1_score(y_true, y_pred_class, average=None)
     
     return [('accuracy', accuracy, True), 
             ('class0_acc', class_acc[0], True),
             ('class1_acc', class_acc[1], True),
             ('class2_acc', class_acc[2], True),
-            ('class3_acc', class_acc[3], True),
-            ('class4_acc', class_acc[4], True)]
+            ('class0_f1', f1_scores[0], True),
+            ('class1_f1', f1_scores[1], True),
+            ('class2_f1', f1_scores[2], True)]
 
 def analyze_data_quality(data):
     """数据质量分析报告"""
@@ -497,82 +510,78 @@ def analyze_data_quality(data):
     
     logger.info("=== 分析完成 ===")
 
+def compute_sample_weights(y):
+    """改进的权重计算方法"""
+    class_counts = np.bincount(y.astype(int))
+    median_freq = np.median(class_counts)
+    class_weights = {i: median_freq / count for i, count in enumerate(class_counts)}
+    return np.array([class_weights[int(yi)] for yi in y])
+
 def main():
-    logger.info("=== 开始增强版模型训练 ===")
+    logger.info("=== 开始增量训练 ===")
     log_memory_usage()
     
-    logger.info("加载数据...")
-    try:
-        full_data = pd.read_feather('train.feather')
-        logger.info(f"数据加载完成，总行数：{len(full_data):,}")
-        logger.info(f"可用列: {full_data.columns.tolist()}")
-        
-    except Exception as e:
-        logger.error(f"数据加载失败: {str(e)}")
-        return
-    
-    # 添加特征验证
-    required_features = [
-        'relative_spread', 'depth_imbalance',
-        'bid_ask_slope', 'order_book_pressure', 'weighted_price_depth',
-        'liquidity_imbalance', 'flow_toxicity', 'price_momentum',
-        'volatility_ratio', 'ofi', 'vpin', 'pressure_change_rate',
-        'orderbook_gradient', 'depth_pressure_ratio'
-    ]
-    
-    missing = [f for f in required_features if f not in full_data.columns]
-    if missing:
-        logger.error(f"缺失关键特征: {missing}")
-        return
-    
-    log_memory_usage()
-    
-    logger.info("开始数据预处理...")
-    processed_data = process_chunk(full_data)
-    
-    # 添加数据质量分析
-    analyze_data_quality(processed_data)
-    
-    log_memory_usage()
-    
-    logger.info("开始特征工程...")
-    feature_data = create_features(processed_data)
-    if feature_data is None:
-        logger.error("特征工程失败，终止程序！")
-        return
-    
-    # 添加最终数据检查
-    # logger.info("执行最终数据验证...")
-    # if feature_data.isna().sum().sum() > 0:
-    #     logger.error(f"最终数据包含 {feature_data.isna().sum().sum()} 个缺失值！")
-    #     return
-    
-    # inf_check = feature_data.applymap(lambda x: np.isinf(x)).sum().sum()
-    # if inf_check > 0:
-    #     logger.error(f"最终数据包含 {inf_check} 个无限值！")
-    #     return
-    
-    log_memory_usage()
-    
+    # 添加config定义
     config = {
-        'window_size': 3600 * 6,
-        'prediction_horizon': 60,
-        'max_features': 500
+        'num_classes': 3,
+        'max_features': 200,
+        'training_params': {
+            'early_stopping_rounds': 30,
+            'num_boost_round': 100
+        }
     }
     
-    # 添加训练前检查
-    if len(feature_data) < 1000:
-        logger.error(f"数据量不足，当前样本数：{len(feature_data)}")
-        return
+    logger.info("流式加载Feather数据...")
+    model = None
+    feature_columns = None
     
-    logger.info(f"训练配置：{config}")
-    
-    models, metrics = train_enhanced_model(feature_data, config)
-    
-    logger.info("保存模型...")
-    for idx, model in enumerate(models):
-        model.save_model(f'enhanced_model_v{idx}.bin')
-        logger.info(f"模型 {idx} 已保存")
+    try:
+        # 使用修正后的流式读取
+        chunk_generator = stream_feather_chunks('train.feather')
+        for chunk_idx, raw_chunk in enumerate(chunk_generator):
+            logger.info(f"\n处理数据块 {chunk_idx+1}...")
+            
+            # 数据预处理
+            processed_chunk = process_chunk(raw_chunk)
+            
+            # 特征工程
+            feature_chunk = create_features(processed_chunk)
+            if feature_chunk is None:
+                continue
+                
+            # 确保特征列一致性
+            if feature_columns is None:
+                feature_columns = feature_chunk.columns.tolist()
+            else:
+                # 对齐特征列（添加缺失列，删除多余列）
+                missing_cols = set(feature_columns) - set(feature_chunk.columns)
+                extra_cols = set(feature_chunk.columns) - set(feature_columns)
+                
+                for col in missing_cols:
+                    feature_chunk[col] = 0  # 用0填充缺失特征
+                feature_chunk = feature_chunk[feature_columns]
+                
+                if missing_cols or extra_cols:
+                    logger.warning(f"特征列不一致 - 缺失: {missing_cols}, 多余: {extra_cols}")
+            
+            # 增量训练
+            model = train_enhanced_model(feature_chunk)
+            
+            # 内存清理
+            del raw_chunk, processed_chunk, feature_chunk
+            gc.collect()
+            log_memory_usage()
+            
+        # 最终保存模型
+        if model is not None:
+            model.save_model('incremental_model.bin')
+            logger.info("最终模型已保存")
+            
+    except Exception as e:
+        logger.error(f"训练过程异常终止: {str(e)}")
+        if model is not None:
+            model.save_model('interrupted_model.bin')
+            logger.info("已保存中断时的模型")
     
     logger.info("=== 训练流程完成 ===")
     log_memory_usage()

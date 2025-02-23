@@ -13,14 +13,18 @@ from tqdm import tqdm
 import matplotlib.dates as mdates
 from scipy import stats
 from datetime import datetime, timedelta
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, f1_score
 
 class ModelEvaluator:
-    def __init__(self, model_paths, test_data_path='test.feather', thresholds=[-0.0004, -0.0002, 0.0002, 0.0004]):
+    def __init__(self, model_paths, test_data_path='test.feather', 
+                 lower_threshold=-0.0004, upper_threshold=0.0004,
+                 window_multiplier=2):
         self.models = [lgb.Booster(model_file=path) for path in model_paths]
         self.test_data_path = test_data_path
         self.scaler = RobustScaler()
-        self.thresholds = thresholds  # 分类阈值
+        self.lower_threshold = lower_threshold
+        self.upper_threshold = upper_threshold
+        self.window_multiplier = window_multiplier
         
     def _load_and_preprocess(self):
         """加载并预处理测试数据"""
@@ -57,13 +61,18 @@ class ModelEvaluator:
                 logger.warning(f"删除非数值列: {col}")
                 test_data = test_data.drop(columns=[col])
         
-        # 修改特征验证列表（移除mid_price）
+        # 在删除列之前添加滞后特征
+        test_data['price_change_lag1'] = test_data['log_return'].shift(1)
+        test_data['order_flow_lag2'] = test_data['flow_toxicity'].shift(2)
+        
+        # 修改后的特征保留列表
         required_features = [
-            'relative_spread', 'depth_imbalance',
-            'bid_ask_slope', 'order_book_pressure', 'weighted_price_depth',
-            'liquidity_imbalance', 'flow_toxicity', 'price_momentum',
-            'volatility_ratio', 'ofi', 'vpin', 'pressure_change_rate',
-            'orderbook_gradient', 'depth_pressure_ratio'
+            'relative_spread', 'depth_imbalance', 'bid_ask_slope',
+            'order_book_pressure', 'weighted_price_depth', 'liquidity_imbalance',
+            'flow_toxicity', 'price_momentum', 'volatility_ratio',
+            'ofi', 'vpin', 'pressure_change_rate',
+            'orderbook_gradient', 'depth_pressure_ratio',
+            'price_change_lag1', 'order_flow_lag2'  # 新增滞后特征
         ]
         
         # 添加调试信息
@@ -78,9 +87,13 @@ class ModelEvaluator:
         
         return test_data.dropna(subset=['log_return'])
 
-    def _create_rolling_features(self, data, window_sizes=[60, 300, 900, 1800]):
-        """滚动特征生成（与训练时一致）"""
+    def _create_rolling_features(self, data):
+        """滚动特征生成（与训练时严格一致）"""
         logger.info("创建滚动特征...")
+        
+        # 使用与训练代码完全相同的窗口定义
+        base_window_sizes = [60, 300, 900, 1800]  # 单位：秒
+        adjusted_windows = [w * self.window_multiplier for w in base_window_sizes]
         
         base_features = [
             'relative_spread', 'depth_imbalance', 'bid_ask_slope',
@@ -90,7 +103,7 @@ class ModelEvaluator:
             'orderbook_gradient', 'depth_pressure_ratio'
         ]
         
-        for window in window_sizes:
+        for window in adjusted_windows:  # 使用调整后的窗口
             rolled = data[base_features].rolling(window, min_periods=1)
             
             stats = pd.concat([
@@ -109,8 +122,8 @@ class ModelEvaluator:
         # 将预测概率转换为类别
         y_pred_class = np.argmax(y_pred, axis=1)
         
-        # 识别大幅波动（类别0和4）
-        large_moves = (y_true == 0) | (y_true == 4)
+        # 识别大幅波动（类别0和2）
+        large_moves = (y_true == 0) | (y_true == 2)
         
         if not any(large_moves):
             return {
@@ -141,7 +154,7 @@ class ModelEvaluator:
         y_pred_class = np.argmax(y_pred, axis=1)
         
         # 定义交易信号
-        # 0: 大跌, 1: 小跌, 2: 震荡, 3: 小涨, 4: 大涨
+        # 0: 下跌, 1: 平稳, 2: 上涨
         position_changes = y_pred_class[1:] != y_pred_class[:-1]
         trade_points = np.where(position_changes)[0]
         
@@ -159,9 +172,9 @@ class ModelEvaluator:
                 # 根据预测类别开新仓，且收益率绝对值大于万分之4
                 pred_class = y_pred_class[i]
                 if np.abs(y_pred[i, pred_class]) > 0.0004:
-                    if pred_class in [0, 1]:  # 预测下跌
+                    if pred_class == 0:  # 预测下跌
                         current_position = -1
-                    elif pred_class in [3, 4]:  # 预测上涨
+                    elif pred_class == 2:  # 预测上涨
                         current_position = 1
                     else:  # 震荡时不开仓
                         current_position = 0
@@ -182,20 +195,18 @@ class ModelEvaluator:
         test_data = self._load_and_preprocess()
         test_data = self._create_rolling_features(test_data)
         
-        # 创建目标变量（五分类）
+        # 创建目标变量（三分类）
         prediction_points = 120
         price_change_rate = (test_data['mid_price'].shift(-prediction_points) - 
                             test_data['mid_price']) / test_data['mid_price']
         
         conditions = [
-            price_change_rate <= self.thresholds[0],  # 大跌
-            (price_change_rate > self.thresholds[0]) & (price_change_rate <= self.thresholds[1]),  # 小跌
-            (price_change_rate > self.thresholds[1]) & (price_change_rate < self.thresholds[2]),   # 震荡
-            (price_change_rate >= self.thresholds[2]) & (price_change_rate < self.thresholds[3]),  # 小涨
-            price_change_rate >= self.thresholds[3]    # 大涨
+            (price_change_rate < self.lower_threshold),  # 下跌
+            price_change_rate.between(self.lower_threshold, self.upper_threshold),  # 平稳
+            (price_change_rate > self.upper_threshold)  # 上涨
         ]
-        values = [0, 1, 2, 3, 4]
-        test_data['target_class'] = np.select(conditions, values, default=2)
+        values = [0, 1, 2]
+        test_data['target_class'] = np.select(conditions, values, default=1)
         
         # 获取训练模型的特征列表
         train_features = self.models[0].feature_name()
@@ -208,9 +219,29 @@ class ModelEvaluator:
                        if col not in excluded_columns
                        and test_data[col].dtype in ['float64', 'float32', 'int64', 'int32']]
         
-        # 重命名特征列以匹配训练模型的特征名称
-        feature_mapping = {feature: f'Column_{i}' for i, feature in enumerate(feature_cols)}
+        # 创建动态特征映射（确保顺序一致）
+        feature_mapping = {}
+        for i, feature in enumerate(train_features):
+            if i < len(feature_cols):
+                # 映射训练特征到测试数据列
+                feature_mapping[feature_cols[i]] = feature
+            else:
+                logger.warning(f"训练特征 {feature} 在测试数据中不存在")
+        
+        # 重命名测试数据特征列
         test_data_renamed = test_data[feature_cols].rename(columns=feature_mapping)
+        
+        # 仅保留训练模型存在的特征
+        test_data_renamed = test_data_renamed.reindex(columns=train_features, fill_value=0)
+        
+        # 添加特征数量验证
+        if len(test_data_renamed.columns) != len(train_features):
+            missing = set(train_features) - set(test_data_renamed.columns)
+            extra = set(test_data_renamed.columns) - set(train_features)
+            logger.error(f"特征数量不匹配 训练: {len(train_features)} 测试: {len(test_data_renamed.columns)}")
+            logger.error(f"缺失特征: {missing}")
+            logger.error(f"多余特征: {extra}")
+            raise ValueError("特征数量不匹配，请检查特征工程逻辑")
         
         logger.info(f"测试数据特征数: {len(feature_cols)}")
         logger.info(f"测试数据特征: {feature_cols[:10]}...")  # 只显示前10个特征
@@ -240,17 +271,21 @@ class ModelEvaluator:
         y_test = y_test.astype(np.int32)
         
         # 模型预测
-        predictions = np.zeros((len(X_test), 5))  # 5个类别的概率
+        predictions = np.zeros((len(X_test), 3))  # 3个类别的概率
         for model in self.models:
             predictions += model.predict(X_test)
         predictions /= len(self.models)
         
+        # 添加预测概率维度检查
+        if predictions.shape[1] != 3:
+            raise ValueError(f"预测概率维度错误: {predictions.shape[1]}，应该为3")
+        
         # 计算混淆矩阵  
         y_pred_class = np.argmax(predictions, axis=1)
         
-        # 确保生成5x5的混淆矩阵
-        y_test_cat = pd.Categorical(y_test, categories=[0, 1, 2, 3, 4])
-        y_pred_cat = pd.Categorical(y_pred_class, categories=[0, 1, 2, 3, 4])
+        # 生成3x3的混淆矩阵
+        y_test_cat = pd.Categorical(y_test, categories=[0, 1, 2])
+        y_pred_cat = pd.Categorical(y_pred_class, categories=[0, 1, 2])
         
         confusion_matrix = pd.crosstab(
             y_test_cat, 
@@ -284,12 +319,22 @@ class ModelEvaluator:
         # 添加每个类别的F1-score
         logger.info("\nDetailed Classification Report:")
         logger.info(classification_report(y_test, y_pred_class, 
-                  target_names=['Sharp Drop', 'Mild Drop', 'Neutral', 'Mild Rise', 'Sharp Rise']))
+                  target_names=['Down', 'Neutral', 'Up']))
         
         # 添加特征与目标的相关性分析
         corr_matrix = test_data.corr()[['target_class']]
         logger.info("\n特征与目标相关性:")
         logger.info(corr_matrix.sort_values('target_class', ascending=False))
+        
+        # 添加类别检查
+        unique_classes = np.unique(test_data['target_class'])
+        if not np.array_equal(unique_classes, np.array([0, 1, 2])):
+            logger.warning(f"目标类别异常: {unique_classes}")
+        
+        # 添加模型输出检查
+        for model in self.models:
+            if model.params.get('num_class') != 3:
+                logger.warning(f"模型类别数配置可能有误: {model.params.get('num_class')}")
         
         # 汇总结果
         results = {
@@ -308,6 +353,19 @@ class ModelEvaluator:
             'Actuals': y_test
         }
         
+        # 添加更多评估指标
+        results.update({
+            'MacroF1': f1_score(y_test, y_pred_class, average='macro'),
+            'WeightedF1': f1_score(y_test, y_pred_class, average='weighted'),
+            'ClassDistribution': class_distribution.to_dict(),
+            'ConfidenceStats': {
+                'mean': np.mean(np.max(predictions, axis=1)),
+                'std': np.std(np.max(predictions, axis=1)),
+                'min': np.min(np.max(predictions, axis=1)),
+                'max': np.max(np.max(predictions, axis=1))
+            }
+        })
+        
         # 生成可视化
         self._generate_enhanced_plots(test_data, results, large_move_analysis)
         
@@ -319,26 +377,26 @@ class ModelEvaluator:
         os.makedirs(output_dir, exist_ok=True)
         
         # 1. Confusion Matrix Heatmap
-        plt.figure(figsize=(10, 8))
+        plt.figure(figsize=(8, 6))
         sns.heatmap(results['ConfusionMatrix'], 
                     annot=True, 
                     fmt='d',
                     cmap='YlOrRd',
-                    xticklabels=['Sharp Drop', 'Mild Drop', 'Neutral', 'Mild Rise', 'Sharp Rise'],
-                    yticklabels=['Sharp Drop', 'Mild Drop', 'Neutral', 'Mild Rise', 'Sharp Rise'])
+                    xticklabels=['Down', 'Neutral', 'Up'],
+                    yticklabels=['Down', 'Neutral', 'Up'])
         plt.title('Confusion Matrix')
         plt.tight_layout()
         plt.savefig(f"{output_dir}/01_confusion_matrix.png")
         plt.close()
 
         # 2. Class Distribution
-        plt.figure(figsize=(10, 6))
+        plt.figure(figsize=(8, 5))
         class_counts = pd.Series(results['Actuals']).value_counts().sort_index()
         sns.barplot(x=class_counts.index, y=class_counts.values)
         plt.title('Class Distribution')
         plt.xlabel('Class')
         plt.ylabel('Count')
-        plt.xticks(range(5), ['Sharp Drop', 'Mild Drop', 'Neutral', 'Mild Rise', 'Sharp Rise'])
+        plt.xticks(range(3), ['Down', 'Neutral', 'Up'])
         plt.tight_layout()
         plt.savefig(f"{output_dir}/02_class_distribution.png")
         plt.close()
@@ -355,13 +413,13 @@ class ModelEvaluator:
         plt.close()
 
         # 4. Class Accuracies
-        plt.figure(figsize=(10, 6))
+        plt.figure(figsize=(8, 5))
         accuracies = pd.Series(results['ClassAccuracies'])
         sns.barplot(x=accuracies.index, y=accuracies.values)
         plt.title('Accuracy by Class')
         plt.xlabel('Class')
         plt.ylabel('Accuracy')
-        plt.xticks(range(5), ['Sharp Drop', 'Mild Drop', 'Neutral', 'Mild Rise', 'Sharp Rise'])
+        plt.xticks(range(3), ['Down', 'Neutral', 'Up'])
         plt.tight_layout()
         plt.savefig(f"{output_dir}/04_class_accuracies.png")
         plt.close()
@@ -430,7 +488,7 @@ if __name__ == "__main__":
     # 示例用法
     model_paths = [f'enhanced_model_v{i}.bin' for i in range(3)]
     
-    evaluator = ModelEvaluator(model_paths, thresholds=[-0.0004, -0.0002, 0.0002, 0.0004])  # 设置分类阈值
+    evaluator = ModelEvaluator(model_paths, lower_threshold=-0.0004, upper_threshold=0.0004)  # 设置分类阈值
     results = evaluator.evaluate()
     
     logger.info("\n=== 最终评估结果 ===")
@@ -444,3 +502,29 @@ if __name__ == "__main__":
     logger.info(f"平均亏损: {results['AvgLoss']:.6f}")
     logger.info(f"盈亏比: {results['ProfitFactor']:.2f}")
     logger.info(f"总交易次数: {results['TradeCount']}")
+
+    # 添加更详细的评估结果输出
+    logger.info("\n=== 详细评估结果 ===")
+    logger.info("1. 分类性能:")
+    logger.info(f"整体准确率: {results['OverallAccuracy']:.4f}")
+    logger.info(f"宏观F1分数: {results['MacroF1']:.4f}")
+    logger.info(f"加权F1分数: {results['WeightedF1']:.4f}")
+    
+    logger.info("\n2. 类别分布:")
+    for cls, ratio in results['ClassDistribution'].items():
+        logger.info(f"类别 {cls}: {ratio:.2%}")
+    
+    logger.info("\n3. 大幅波动预测:")
+    logger.info(f"大幅波动准确率: {results['LargeMoveAccuracy']:.4f}")
+    logger.info(f"大幅波动样本数: {results['LargeMoveCount']}")
+    
+    logger.info("\n4. 交易性能:")
+    logger.info(f"胜率: {results['WinRate']:.2%}")
+    logger.info(f"盈亏比: {results['ProfitFactor']:.2f}")
+    logger.info(f"平均盈利: {results['AvgWin']:.6f}")
+    logger.info(f"平均亏损: {results['AvgLoss']:.6f}")
+    logger.info(f"总交易次数: {results['TradeCount']}")
+    
+    logger.info("\n5. 预测置信度:")
+    logger.info(f"平均置信度: {results['ConfidenceStats']['mean']:.4f}")
+    logger.info(f"置信度标准差: {results['ConfidenceStats']['std']:.4f}")
