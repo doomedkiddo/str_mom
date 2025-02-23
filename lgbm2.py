@@ -72,8 +72,7 @@ def process_chunk(chunk):
             q3 = chunk[col].quantile(0.99)
             chunk[col] = np.clip(chunk[col], q1, q3)
     
-    # 处理缺失值
-    chunk = chunk[features_to_keep].fillna(method='ffill').fillna(method='bfill').fillna(0)
+    chunk = chunk[features_to_keep].ffill().bfill().fillna(0)
     
     # 特征分布检查
     logger.info("特征分布检查:")
@@ -362,6 +361,44 @@ def train_enhanced_model(data, config):
         
         # 特征选择（保留前100个重要特征）
         selected_features = importance.head(100)['feature'].values
+        
+        # +++ 新增共线性过滤 +++
+        logger.info("执行共线性特征过滤...")
+        try:
+            # 获取特征索引
+            feature_indices = [model.feature_name().index(f) for f in selected_features]
+            
+            # 使用索引从X_train中获取特征数据
+            feature_data = pd.DataFrame(
+                X_train[:, feature_indices],
+                columns=selected_features
+            )
+            
+            corr_matrix = feature_data.corr().abs()
+            
+            # 过滤高相关性特征
+            to_remove = set()
+            for i in range(len(selected_features)):
+                if selected_features[i] in to_remove:
+                    continue
+                for j in range(i+1, len(selected_features)):
+                    if corr_matrix.loc[selected_features[i], selected_features[j]] > 0.8:
+                        to_remove.add(selected_features[j])
+            
+            selected_features = [f for f in selected_features if f not in to_remove]
+            logger.info(f"共线性过滤后保留特征数: {len(selected_features)}")
+            
+            # 记录被移除的特征
+            removed_features = list(to_remove)
+            if removed_features:
+                logger.info(f"被移除的高相关性特征: {removed_features}")
+                
+        except Exception as e:
+            logger.error(f"共线性过滤失败: {str(e)}")
+            logger.error(f"可用的特征名称: {model.feature_name()[:10]}...")  # 打印前10个特征名称作为示例
+            return [], []
+        
+        # 更新特征选择
         X_train = X_train[:, [model.feature_name().index(f) for f in selected_features]]
         X_val = X_val[:, [model.feature_name().index(f) for f in selected_features]]
         
@@ -441,8 +478,9 @@ def analyze_data_quality(data):
     missing = data.isna().sum()
     logger.info(f"\n缺失值统计:\n{missing[missing > 0]}")
     
-    # 无限值分析
-    inf_counts = data.applymap(lambda x: np.isinf(x)).sum()
+    # 无限值分析（限制为数值型数据）
+    numeric_data = data.select_dtypes(include=[np.number])
+    inf_counts = np.isinf(numeric_data).sum()
     logger.info(f"\n无限值统计:\n{inf_counts[inf_counts > 0]}")
     
     # 数值分布分析

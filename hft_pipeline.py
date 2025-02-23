@@ -648,8 +648,8 @@ class HFTDataEngine:
 
 if __name__ == "__main__":
     engine = HFTDataEngine(
-        start_date=datetime(2025, 2, 13),
-        end_date=datetime(2025, 2, 16),
+        start_date=datetime(2025, 2, 1),
+        end_date=datetime(2025, 2, 22),
         chunk_size=100000
     )
     
