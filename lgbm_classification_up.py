@@ -478,7 +478,7 @@ def main():
     
     logger.info("保存模型...")
     for idx, model in enumerate(models):
-        model.save_model(f'enhanced_model_v{idx}.bin')
+        model.save_model(f'model_up_v{idx}.bin')
         logger.info(f"模型 {idx} 已保存")
     
     logger.info("=== 训练流程完成 ===")
