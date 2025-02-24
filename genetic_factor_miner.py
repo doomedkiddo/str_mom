@@ -43,7 +43,7 @@ def evaluate_individual_wrapper(args):
     try:
         logger.debug(f"开始评估因子: {str(individual)[:50]}...")
         
-        # 将Individual对象转换为普通元组
+        # 将Individual对象转换为元组
         if hasattr(individual, '__iter__'):
             expr = tuple(individual)
         else:
@@ -51,16 +51,22 @@ def evaluate_individual_wrapper(args):
         
         # 修改数据哈希方式
         hashable_data = []
-        for k, v in data_dict.items():
-            if isinstance(v, np.ndarray):
-                # 使用数组的内存视图和属性创建可哈希的元组
-                hashable_data.append((k, v.tobytes(), v.shape, v.dtype.str))
-        
-        # 转换为元组确保可哈希
-        data_tuple = tuple(sorted(hashable_data))
-        
-        # 评估因子
-        factor_values = evaluate_expression(expr, data_tuple)
+        try:
+            for k, v in data_dict.items():
+                if isinstance(v, np.ndarray):
+                    # 使用数组的内存视图和属性创建可哈希的元组
+                    hashable_data.append((str(k), v.tobytes(), v.shape, v.dtype.str))
+            
+            # 转换为元组确保可哈希
+            data_tuple = tuple(sorted(hashable_data))
+            
+            # 评估因子
+            factor_values = evaluate_expression(expr, data_tuple)
+            
+        except Exception as e:
+            logger.error(f"数据处理失败: {str(e)}")
+            return (0, 0, 0, 0)
+            
         if factor_values is None:
             return (0, 0, 0, 0)
             
@@ -129,32 +135,78 @@ def evaluate_expression(expr, data_dict_hash):
     try:
         # 重建数据字典
         data_dict = {}
-        for k, data_bytes, shape, dtype_str in data_dict_hash:
-            # 从字节重建数组
-            data = np.frombuffer(data_bytes, dtype=np.dtype(dtype_str)).reshape(shape)
-            data_dict[k] = data
+        if isinstance(data_dict_hash, (list, tuple)):  # 添加类型检查
+            for k, data_bytes, shape, dtype_str in data_dict_hash:
+                # 从字节重建数组
+                data = np.frombuffer(data_bytes, dtype=np.dtype(dtype_str)).reshape(shape)
+                data_dict[k] = data
+        else:
+            logger.error(f"无效的数据字典哈希类型: {type(data_dict_hash)}")
+            return None
             
         # 处理基本特征直接返回
-        if isinstance(expr, str) and expr in data_dict:
-            return data_dict[expr]
+        if isinstance(expr, str):
+            if expr in data_dict:
+                return data_dict[expr]
+            logger.warning(f"特征名 {expr} 不在数据字典中")
+            return None
             
         # 确保expr是元组
-        if not isinstance(expr, tuple):
+        if not isinstance(expr, (list, tuple)):
+            logger.warning(f"无效的表达式类型: {type(expr)}")
             return None
+            
+        # 将list转换为tuple以确保可哈希
+        if isinstance(expr, list):
+            expr = tuple(expr)
             
         op = expr[0]
         
-        # 处理滚动窗口操作（修复形状问题）
+        # 处理滚动窗口操作（增加参数验证和嵌套处理）
         if op == 'rolling':
             if len(expr) != 4:
                 return None
-            _, operation, feature_name, window = expr
-            if feature_name not in data_dict:
+            _, operation, feature_expr, window = expr
+            
+            # 先评估特征表达式
+            feature_values = evaluate_expression(feature_expr, data_dict_hash)
+            if feature_values is None:
                 return None
-            series = pd.Series(data_dict[feature_name])
-            # 确保输出长度一致
-            result = series.rolling(window, min_periods=1).agg(operation).ffill().values
-            return result[:len(data_dict[feature_name])]  # 截断到原始长度
+                
+            # 验证window参数
+            if isinstance(window, tuple):  # 如果window是表达式
+                window_value = evaluate_expression(window, data_dict_hash)
+                if window_value is None:
+                    return None
+                # 取window表达式结果的均值作为窗口大小
+                window = int(np.mean(window_value))
+            
+            # 确保window是有效的正整数
+            try:
+                window = int(window)
+                if window <= 0:
+                    logger.warning(f"无效的窗口大小: {window}，使用默认值5")
+                    window = 5
+            except (TypeError, ValueError):
+                logger.warning(f"无效的窗口参数类型: {type(window)}，使用默认值5")
+                window = 5
+            
+            # 验证operation参数
+            valid_operations = ['mean', 'std', 'max', 'min']
+            if operation not in valid_operations:
+                logger.warning(f"无效的滚动操作: {operation}，使用mean")
+                operation = 'mean'
+            
+            try:
+                # 使用pandas的rolling操作
+                series = pd.Series(feature_values)
+                result = series.rolling(window, min_periods=1).agg(operation)
+                # 填充开始的NaN值
+                result = result.fillna(method='bfill').fillna(method='ffill')
+                return result.values
+            except Exception as e:
+                logger.error(f"滚动计算失败: {operation} window={window}, 错误: {str(e)}")
+                return None
 
         # 处理二元运算（增加空值检查和长度对齐）
         elif op in ['add', 'sub', 'mul', 'div', 'corr', 'cov', 'ratio', 'residual']:
@@ -301,44 +353,58 @@ class GeneticFactorMiner:
         self.toolbox.register("select", tools.selTournament, tournsize=3)
     
     def _build_expr(self, min_depth, max_depth, depth=0):
-        """构建随机因子表达式（确保返回元组）"""
-        # 当达到最大深度时直接返回特征字符串
-        if depth >= max_depth:
-            return random.choice(self.base_features)  # 返回完整字符串
-        
-        op = random.choice([
-            'add', 'sub', 'mul', 'div', 'sqrt', 'log',
-            'zscore', 'delta', 'lag', 'corr', 'cov',
-            'ratio', 'residual', 'rolling'
-        ])
-        
-        # 确保操作符结构正确并返回元组
-        if op == 'rolling':
-            return (op, 
-                    random.choice(['mean', 'std', 'max', 'min']),
-                    random.choice(self.base_features),
-                    random.randint(5, 60))
-        elif op in ['add', 'sub', 'mul', 'div', 'corr', 'cov', 'ratio', 'residual']:
-            return (op, 
-                    self._build_expr(min_depth, max_depth, depth+1),
-                    self._build_expr(min_depth, max_depth, depth+1))
-        elif op in ['sqrt', 'log', 'zscore', 'delta', 'lag']:
-            return (op, 
-                    self._build_expr(min_depth, max_depth, depth+1))
-        else:
+        """构建随机因子表达式（确保返回元组，限制最大嵌套深度为7）"""
+        try:
+            # 当达到最大深度或超过7层时直接返回特征字符串
+            if depth >= max_depth or depth >= 7:  # 添加深度限制
+                return random.choice(self.base_features)
+            
+            # 根据当前深度调整操作符的选择概率
+            if depth >= 5:  # 当深度较大时，增加返回基础特征的概率
+                if random.random() < 0.6:  # 60%概率直接返回基础特征
+                    return random.choice(self.base_features)
+            
+            op = random.choice([
+                'add', 'sub', 'mul', 'div', 'sqrt', 'log',
+                'zscore', 'delta', 'lag', 'corr', 'cov',
+                'ratio', 'residual', 'rolling'
+            ])
+            
+            # 确保操作符结构正确并返回元组
+            if op == 'rolling':
+                return tuple([op, 
+                        random.choice(['mean', 'std', 'max', 'min']),
+                        random.choice(self.base_features),  # rolling操作直接使用基础特征
+                        random.randint(5, 60)])
+            elif op in ['add', 'sub', 'mul', 'div', 'corr', 'cov', 'ratio', 'residual']:
+                return tuple([op, 
+                        self._build_expr(min_depth, max_depth, depth+1),
+                        self._build_expr(min_depth, max_depth, depth+1)])
+            elif op in ['sqrt', 'log', 'zscore', 'delta', 'lag']:
+                return tuple([op, 
+                        self._build_expr(min_depth, max_depth, depth+1)])
+            else:
+                return random.choice(self.base_features)
+            
+        except Exception as e:
+            logger.error(f"构建表达式失败: {str(e)}")
             return random.choice(self.base_features)
 
     def _generate_random_expression(self, min_depth=2, max_depth=3):
-        """生成随机因子表达式"""
+        """生成随机因子表达式（确保不超过7层）"""
         attempt = 0
-        max_attempts = 5  # 进一步减少尝试次数
+        max_attempts = 5
+        max_depth = min(max_depth, 7)  # 确保max_depth不超过7
         
         while attempt < max_attempts:
             attempt += 1
             try:
                 expr = self._build_expr(min_depth, max_depth)
-                if self._validate_expression(expr):
+                if self._validate_expression(expr) and self._get_depth(expr) <= 7:
                     return expr
+                elif attempt == max_attempts:
+                    logger.warning("生成的表达式深度超过7层，返回简单表达式")
+                    return random.choice(self.base_features)
             except RecursionError:
                 logger.warning("递归深度过大，尝试生成更简单表达式")
                 return random.choice(self.base_features)
