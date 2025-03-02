@@ -346,11 +346,11 @@ def train_enhanced_model(data, model=None):
         'objective': 'multiclass',
         'num_class': 3,
         'metric': ['multi_logloss', 'multi_error'],
-        'num_leaves': 27,
+        'num_leaves': 27,  # Keep your original setting
         'learning_rate': 0.003,
         'feature_fraction': 0.6,
         'min_data_in_leaf': 100,
-        'max_depth': 7,
+        'max_depth': -1,  # Let LightGBM determine max_depth based on num_leaves
         'lambda_l1': 0.2,
         'lambda_l2': 0.2,
         'min_gain_to_split': 0.1,
@@ -536,8 +536,8 @@ def main():
     feature_columns = None
     
     try:
-        # 使用修正后的流式读取
-        chunk_generator = stream_feather_chunks('train.feather')
+        # 修改chunksize参数为500000（原100000的5倍）
+        chunk_generator = stream_feather_chunks('train.feather', chunksize=500000)
         for chunk_idx, raw_chunk in enumerate(chunk_generator):
             logger.info(f"\n处理数据块 {chunk_idx+1}...")
             
