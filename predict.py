@@ -17,6 +17,7 @@ import struct
 from ctypes import *
 import uuid
 import sys
+import pyarrow.feather as feather
 
 # Add the SignalData and ShmHeader structures from signal_generator.py
 class SignalData(Structure):
@@ -94,11 +95,18 @@ class OrderBookPredictor:
                  data_save_interval: int = 3600, confidence_threshold: float = 0.6,
                  trading_symbol: str = "DOGEUSDT", order_quantity_usdt: float = 10.0):
         """Initialize ZMQ subscriber, data structures and load the model"""
-        # ZMQ setup
-        self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.SUB)
-        self.socket.connect(zmq_address)
-        self.socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        # ZMQ setup - only if zmq_address is provided
+        self.test_mode = zmq_address is None
+        
+        if not self.test_mode:
+            self.context = zmq.Context()
+            self.socket = self.context.socket(zmq.SUB)
+            self.socket.connect(zmq_address)
+            self.socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        else:
+            logger.info("Running in test mode - ZMQ connection disabled")
+            self.context = None
+            self.socket = None
         
         # Data structures - updated window size to match training
         self.window_size = 1800  # 1800 data points (15 minutes at 500ms interval)
@@ -161,9 +169,11 @@ class OrderBookPredictor:
         
         # Control flags
         self.running = True
-        self.process_thread = threading.Thread(target=self._process_messages)
-        self.process_thread.daemon = True
-        self.process_thread.start()
+        # Only start the processing thread in non-test mode
+        if not self.test_mode:
+            self.process_thread = threading.Thread(target=self._process_messages)
+            self.process_thread.daemon = True
+            self.process_thread.start()
         
         # Add counters for monitoring
         self.total_messages = 0
@@ -181,6 +191,9 @@ class OrderBookPredictor:
             'vpin', 'pressure_change_rate', 'orderbook_gradient', 'depth_pressure_ratio'
         ]
         logger.info(f"Base feature columns: {self.base_feature_cols}")
+        
+        # Log model feature names for debugging
+        logger.info(f"Model expects {len(self.feature_names)} features: {self.feature_names}")
 
     def calculate_features(self, data):
         """Calculate features from order book data following hft_pipeline.py logic"""
@@ -363,7 +376,7 @@ class OrderBookPredictor:
         # Store additional data for next calculations
         volume = sum(q for _, q in bids[:3]) + sum(q for _, q in asks[:3])
         
-        # Return complete feature dictionary
+        # Return complete feature dictionary - ensure this contains ALL base features used in lgbm2.py
         return {
             'mid_price': mid_price,
             'relative_spread': relative_spread,
@@ -404,56 +417,95 @@ class OrderBookPredictor:
         # Create DataFrame from the data window
         df = pd.DataFrame(data_window)
         
-        # Basic feature columns based on lgbm2.py
-        feature_cols = self.base_feature_cols
-        
-        # Ensure all required features exist
-        missing_features = [col for col in feature_cols if col not in df.columns]
+        # Check if the DataFrame already has the required base features
+        base_features = self.base_feature_cols
+        missing_features = [col for col in base_features if col not in df.columns]
         if missing_features:
             logger.error(f"Missing required feature columns: {missing_features}")
             logger.info(f"Available columns: {df.columns.tolist()}")
             return None, None
         
+        # Select only relevant features to prevent extra data
+        df_features = df[base_features].copy()
+        
         # Convert features to float32 for consistent processing
-        numeric_df = df[feature_cols].astype(np.float32)
+        df_features = df_features.astype(np.float32)
         
-        # Data validation
-        if numeric_df.isna().any().any():
-            logger.warning("Found NaN values in features, performing forward fill")
-            numeric_df = numeric_df.fillna(method='ffill').fillna(0)
+        # Replace NaN and infinity values
+        df_features = df_features.fillna(method='ffill').fillna(0)
+        df_features = df_features.replace([np.inf, -np.inf], 0)
         
-        # Handle infinity values
-        numeric_df = numeric_df.replace([np.inf, -np.inf], 0)
+        # Define window sizes as in lgbm2.py
+        # 500ms interval means 2 points per second
+        window_multiplier = 2
+        windows = [
+            60 * window_multiplier,    # 1 minute (120 points)
+            300 * window_multiplier,   # 5 minutes (600 points)
+            900 * window_multiplier,   # 15 minutes (1800 points)
+            1800 * window_multiplier   # 30 minutes (3600 points)
+        ]
         
-        # Extract features for prediction - align with lgbm2.py's feature structure
-        features = numeric_df.values[-self.window_size:]
+        logger.info(f"Creating windowed features with base features: {base_features}")
         
-        # Validate shape before flattening
-        if features.shape[0] != self.window_size:
-            logger.error(f"Feature window size mismatch! Expected {self.window_size}, got {features.shape[0]}")
-            return None, None
+        # Create a flat list to hold all computed features
+        all_features = []
+        
+        # Add lagged features like in lgbm2.py
+        if 'price_momentum' in df.columns:
+            df_features['price_change_lag1'] = df['price_momentum'].shift(1).fillna(0)
+        else:
+            df_features['price_change_lag1'] = 0
+        
+        if 'flow_toxicity' in df.columns:
+            df_features['order_flow_lag2'] = df['flow_toxicity'].shift(2).fillna(0)
+        else:
+            df_features['order_flow_lag2'] = 0
+        
+        # Compute rolling statistics for each window size and feature
+        for window in windows:
+            window_name = window
+            logger.debug(f"Computing features for window {window_name}")
             
-        # Flatten the features
-        X = features.flatten()
+            # Create rolling window features
+            rolled = df_features.rolling(window, min_periods=1)
+            
+            # Calculate statistics (match lgbm2.py exactly)
+            mean_features = rolled.mean().add_suffix(f'_ma{window_name}')
+            std_features = rolled.std().add_suffix(f'_std{window_name}')
+            skew_features = rolled.skew().add_suffix(f'_skew{window_name}')
+            kurt_features = rolled.kurt().add_suffix(f'_kurt{window_name}')
+            
+            # Add computed features
+            for feature_set in [mean_features, std_features, skew_features, kurt_features]:
+                feature_set = feature_set.fillna(0)  # Replace NaNs
+                df_features = pd.concat([df_features, feature_set], axis=1)
+        
+        # Ensure we have all expected features from the model
+        feature_names_set = set(self.feature_names)
+        available_features_set = set(df_features.columns)
+        
+        missing = feature_names_set - available_features_set
+        if missing:
+            logger.warning(f"Missing {len(missing)} features expected by model: {missing}")
+            # Add missing features with zeros
+            for feature in missing:
+                df_features[feature] = 0
+        
+        # Take only the features expected by the model in the correct order
+        final_features = df_features[self.feature_names].iloc[-1:].values.flatten()
+        
+        logger.info(f"Created feature vector with shape: {final_features.shape}")
         
         # Validate feature dimensions against what the model expects
         expected_features = len(self.feature_names)
-        actual_features = X.shape[0]
+        actual_features = final_features.shape[0]
         
         if actual_features != expected_features:
             logger.error(f"Feature dimension mismatch! Model expects {expected_features}, actual {actual_features}")
-            logger.error(f"This usually indicates the feature creation process doesn't match training")
-            
-            # Additional debugging information
-            logger.error(f"Model feature names: {self.feature_names}")
-            logger.error(f"Current feature shape: {features.shape}")
-            
             return None, None
         
-        # Ensure data type is consistent with training
-        X = X.astype(np.float32)
-        
-        return X.reshape(1, -1), None
+        # Return feature vector as a single row
+        return final_features.reshape(1, -1), None
 
     def save_data_to_file(self):
         """Save collected data to a file"""
@@ -578,7 +630,7 @@ class OrderBookPredictor:
                     # Make prediction when enough data and time has passed
                     if (len(self.data_window) >= self.window_size and
                         (last_prediction_time is None or 
-                         timestamp - last_prediction_time >= timedelta(seconds=10))):
+                         timestamp - last_prediction_time >= timedelta(seconds=1))):
                         
                         # Get current price for trading
                         current_price = features['mid_price']
@@ -646,9 +698,14 @@ class OrderBookPredictor:
                 logger.warning(f"Ignoring non-tradable action: {action}")
                 return None
             
-            # Calculate quantity based on fixed USDT amount
-            # For simplicity, calculate quantity as USDT amount / price
-            quantity = self.order_quantity_usdt / price
+            # Get symbol precision requirements
+            qty_precision, price_precision = self.get_symbol_precision(self.trading_symbol)
+            
+            # Calculate quantity based on fixed USDT amount and round to correct precision
+            quantity = round(self.order_quantity_usdt / price, qty_precision)
+            
+            # Round price to correct precision
+            price = round(price, price_precision)
             
             # Generate a unique client order ID
             client_order_id = f"pred_{uuid.uuid4().hex[:16]}"
@@ -714,15 +771,36 @@ class OrderBookPredictor:
             # Generate trading signal
             signal = self.generate_trading_signal(raw_pred, timestamp, current_price)
             
-            # Execute trading action if signal generated
-            if signal and signal['action'] != 'HOLD':
-                # Place order at mid price
-                client_order_id = self.place_order(signal['action'], current_price)
+            # 总是记录预测结果，不管是否产生交易信号
+            if signal:
+                logger.info(f"\n=== PREDICTION RESULT ===")
+                logger.info(f"Time: {signal['timestamp']}")
+                logger.info(f"Action: {signal['action']}")
+                logger.info(f"Price: {signal['price']:.8f}")
+                logger.info(f"Confidence: {signal['confidence']:.4f}")
                 
-                if client_order_id:
-                    # Add order ID to the signal for reference
-                    signal['client_order_id'] = client_order_id
-                    logger.info(f"Order placed with client ID: {client_order_id}")
+                # 显示详细的预测信息
+                if 'prediction' in signal:
+                    if self.is_classification:
+                        probs = signal['prediction']['probabilities']
+                        logger.info(f"Class Probabilities: Down={probs['down']:.4f}, Neutral={probs['neutral']:.4f}, Up={probs['up']:.4f}")
+                    else:
+                        logger.info(f"Predicted Return: {signal['prediction']['predicted_return']:.6f}")
+                
+                logger.info(f"====================\n")
+                
+                # 只在产生实际交易信号时执行交易操作
+                if signal['action'] != 'HOLD':
+                    # Place order at mid price
+                    client_order_id = self.place_order(signal['action'], current_price)
+                    
+                    if client_order_id:
+                        # Add order ID to the signal for reference
+                        signal['client_order_id'] = client_order_id
+                        logger.info(f"Order placed with client ID: {client_order_id}")
+                    
+                    # Add to trade log only actual trades
+                    self.trade_log.append(signal)
             
             return signal
             
@@ -751,14 +829,162 @@ class OrderBookPredictor:
             except Exception as e:
                 logger.error(f"Error saving trade log: {e}")
         
-        # Wait for thread to complete
-        if self.process_thread.is_alive():
+        # Wait for thread to complete if not in test mode
+        if not self.test_mode and self.process_thread and self.process_thread.is_alive():
             self.process_thread.join(timeout=2.0)
             
-        # Clean up ZMQ resources
-        self.socket.close()
-        self.context.term()
+            # Clean up ZMQ resources
+            self.socket.close()
+            self.context.term()
+        
         logger.info("Predictor stopped and resources cleaned up")
+
+    def get_symbol_precision(self, symbol):
+        """Get quantity and price precision for different symbols"""
+        # Add more symbols as needed
+        precision_map = {
+            'DOGEUSDT': (0, 5),    # Quantity: 0 decimals, Price: 5 decimals
+            'BTCUSDT': (5, 2),
+            'ETHUSDT': (4, 2),
+            'BNBUSDT': (3, 4),
+            'SOLUSDT': (2, 4)
+        }
+        return precision_map.get(symbol, (3, 5))  # Default to 3 qty decimals, 5 price decimals
+
+def test_predictor(model_path, feather_file):
+    """Test the model prediction pipeline using data from a feather file
+    
+    Args:
+        model_path: Path to the trained model
+        feather_file: Path to the feather file with orderbook data
+    """
+    logger.info(f"Testing predictor with model: {model_path} and data: {feather_file}")
+    
+    try:
+        # Create a predictor instance without ZMQ (we'll feed data manually)
+        predictor = OrderBookPredictor(
+            model_path=model_path,
+            zmq_address=None,  # Don't connect to ZMQ
+            data_save_interval=3600,
+            confidence_threshold=0.3
+        )
+        
+        # Load data from feather file
+        logger.info(f"Loading data from {feather_file}")
+        df = feather.read_feather(feather_file)
+        logger.info(f"Loaded {len(df)} rows with columns: {df.columns.tolist()}")
+        
+        # Check if this is raw order book data or pre-processed features
+        is_raw_orderbook = any(col.startswith('bid_') or col.startswith('ask_') for col in df.columns)
+        logger.info(f"Detected raw orderbook data: {is_raw_orderbook}")
+        
+        # Sample size for testing
+        sample_size = min(3000, len(df))
+        logger.info(f"Using sample of {sample_size} rows for testing")
+        
+        # Take a sample from the data
+        sample_df = df.head(sample_size)
+        
+        # Initialize data window with features
+        for idx, row in sample_df.iterrows():
+            if is_raw_orderbook:
+                # Convert raw orderbook data to the format expected by calculate_features
+                bids = []
+                asks = []
+                
+                # Extract bid levels
+                for i in range(20):  # Assuming up to 20 levels
+                    bid_price_col = f'bid_{i}_price'
+                    bid_size_col = f'bid_{i}_size'
+                    if bid_price_col in row and bid_size_col in row:
+                        bids.append({
+                            'price': float(row[bid_price_col]),
+                            'quantity': float(row[bid_size_col])
+                        })
+                
+                # Extract ask levels
+                for i in range(20):  # Assuming up to 20 levels
+                    ask_price_col = f'ask_{i}_price'
+                    ask_size_col = f'ask_{i}_size'
+                    if ask_price_col in row and ask_size_col in row:
+                        asks.append({
+                            'price': float(row[ask_price_col]),
+                            'quantity': float(row[ask_size_col])
+                        })
+                
+                # Create orderbook data structure
+                orderbook_data = {
+                    'bids': bids,
+                    'asks': asks,
+                    'timestamp': time.time() * 1e9  # Convert to nanoseconds
+                }
+                
+                # Calculate features
+                features = predictor.calculate_features(orderbook_data)
+            else:
+                # If data already has features, use them directly
+                features = {}
+                for col in row.index:
+                    if col not in ['index', 'Timestamp', 'origin_time', 'received_time']:
+                        features[col] = row[col]
+            
+            # Add to predictor's data window
+            predictor.data_window.append(features)
+            
+            # Log progress occasionally
+            if len(predictor.data_window) % 500 == 0:
+                logger.info(f"Processed {len(predictor.data_window)} data points")
+        
+        logger.info(f"Filled data window with {len(predictor.data_window)} points")
+        
+        # Ensure we have enough data
+        if len(predictor.data_window) < predictor.window_size:
+            logger.error(f"Not enough data: {len(predictor.data_window)}/{predictor.window_size}")
+            return False
+        
+        # Test feature creation
+        X, _ = predictor.create_features(list(predictor.data_window))
+        
+        if X is not None:
+            logger.info(f"Feature creation SUCCESS! Shape: {X.shape}")
+            
+            # Try making a prediction
+            try:
+                raw_pred = predictor.model.predict(X)
+                
+                # Get shape info for debugging
+                if isinstance(raw_pred, np.ndarray):
+                    pred_shape = raw_pred.shape
+                else:
+                    pred_shape = "Non-array type: " + str(type(raw_pred))
+                    
+                logger.info(f"Prediction successful! Result shape: {pred_shape}")
+                
+                # Generate trading signal
+                signal = predictor.generate_trading_signal(
+                    raw_pred, 
+                    datetime.now(), 
+                    predictor.data_window[-1].get('mid_price', 1.0)
+                )
+                logger.info(f"Signal generated: {signal['action']} with confidence {signal['confidence']:.4f}")
+                
+                if 'prediction' in signal:
+                    logger.info(f"Prediction details: {signal['prediction']}")
+                
+                logger.info("TEST PASSED: The model can successfully generate predictions!")
+                return True
+            except Exception as e:
+                logger.error(f"Prediction failed: {e}")
+                logger.exception("Error details:")
+                return False
+        else:
+            logger.error("Feature creation failed!")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Test failed: {e}")
+        logger.exception("Error details:")
+        return False
 
 def main():
     # Use argparse to allow command-line configuration
@@ -767,10 +993,20 @@ def main():
     parser.add_argument('--model', type=str, default='incremental_model.bin', help='Path to model file')
     parser.add_argument('--zmq_address', type=str, default='tcp://localhost:5555', help='ZMQ socket address')
     parser.add_argument('--save_interval', type=int, default=3600, help='Data save interval in seconds')
-    parser.add_argument('--threshold', type=float, default=0.6, help='Confidence threshold for trading signals')
+    parser.add_argument('--threshold', type=float, default=0.3, help='Confidence threshold for trading signals')
     parser.add_argument('--symbol', type=str, default='DOGEUSDT', help='Trading symbol')
     parser.add_argument('--order_size', type=float, default=10.0, help='Order size in USDT')
+    parser.add_argument('--test', type=str, help='Test mode: provide path to feather file')
     args = parser.parse_args()
+    
+    # Run in test mode if test argument is provided
+    if args.test:
+        success = test_predictor(args.model, args.test)
+        if success:
+            logger.info("Test completed successfully!")
+        else:
+            logger.error("Test failed!")
+        return
     
     predictor = OrderBookPredictor(
         model_path=args.model,

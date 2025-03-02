@@ -537,7 +537,7 @@ def main():
     
     try:
         # 修改chunksize参数为500000（原100000的5倍）
-        chunk_generator = stream_feather_chunks('train.feather', chunksize=500000)
+        chunk_generator = stream_feather_chunks('merged_data.feather', chunksize=500000)
         for chunk_idx, raw_chunk in enumerate(chunk_generator):
             logger.info(f"\n处理数据块 {chunk_idx+1}...")
             

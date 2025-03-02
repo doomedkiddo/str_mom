@@ -15,6 +15,7 @@ from scipy import stats
 from datetime import datetime, timedelta
 from sklearn.metrics import classification_report, f1_score
 import argparse
+from matplotlib.font_manager import FontProperties
 
 class ModelEvaluator:
     def __init__(self, model_paths, test_data_path='test.feather', 
@@ -180,7 +181,7 @@ class ModelEvaluator:
         return results
 
     def _calculate_trading_metrics(self, prices, predictions):
-        """Enhanced trading strategy analysis without confidence threshold"""
+        """实现带止盈止损的交易逻辑"""
         if prices is None or len(prices) == 0:
             logger.warning("未提供价格数据，无法计算交易指标")
             return {
@@ -214,7 +215,16 @@ class ModelEvaluator:
         # 每N个点检查一次交易信号（控制交易频率）
         sample_interval = 10
         
-        # 强制在每个采样时间点进行交易决策
+        # 设置止盈止损参数
+        take_profit = 0.0006  # 万6
+        stop_loss = -0.0004   # 万4
+        max_hold_seconds = 60  # 最大持仓60秒
+        data_freq = 0.5        # 数据频率0.5秒
+        
+        # 转换持仓限制为数据点数量
+        max_hold_points = int(max_hold_seconds / data_freq)
+        
+        # 在交易循环中
         for i in range(1, len(prices)):
             price_change = (prices[i] / prices[i-1]) - 1  # 价格变动百分比
             
@@ -261,6 +271,69 @@ class ModelEvaluator:
                         entry_idx = i
                         entry_price = prices[i]  # Store the actual price
                         logger.debug(f"开多仓: 时间点={i}, 价格={entry_price}")
+            
+            # 检查当前持仓的止盈止损
+            if current_position != 0:
+                current_price = prices[i]
+                holding_time = i - entry_idx
+                price_change = (current_price / entry_price - 1) * current_position
+                
+                # 止盈检查
+                if price_change >= take_profit:
+                    # 平仓
+                    trade_return = take_profit
+                    trade_info = {
+                        'entry': entry_idx,
+                        'exit': i,
+                        'entry_price': entry_price,
+                        'exit_price': current_price,
+                        'return': trade_return,
+                        'duration': holding_time,
+                        'type': 'long' if current_position > 0 else 'short',
+                        'confidence': confidence[entry_idx]
+                    }
+                    trades.append(trade_info)
+                    logger.debug(f"止盈平仓: 时间点={i}, 收益={trade_return:.4f}")
+                    current_position = 0
+                    continue
+                    
+                # 止损检查
+                if price_change <= stop_loss:
+                    # 平仓
+                    trade_return = stop_loss
+                    trade_info = {
+                        'entry': entry_idx,
+                        'exit': i,
+                        'entry_price': entry_price,
+                        'exit_price': current_price,
+                        'return': trade_return,
+                        'duration': holding_time,
+                        'type': 'long' if current_position > 0 else 'short',
+                        'confidence': confidence[entry_idx]
+                    }
+                    trades.append(trade_info)
+                    logger.debug(f"止损平仓: 时间点={i}, 收益={trade_return:.4f}")
+                    current_position = 0
+                    continue
+                    
+                # 持仓时间检查
+                if holding_time >= max_hold_points:
+                    # 平仓
+                    trade_return = (current_price / entry_price - 1) * current_position
+                    trade_info = {
+                        'entry': entry_idx,
+                        'exit': i,
+                        'entry_price': entry_price,
+                        'exit_price': current_price,
+                        'return': trade_return,
+                        'duration': holding_time,
+                        'type': 'long' if current_position > 0 else 'short',
+                        'confidence': confidence[entry_idx]
+                    }
+                    trades.append(trade_info)
+                    logger.debug(f"持仓时间平仓: 时间点={i}, 收益={trade_return:.4f}")
+                    current_position = 0
+                    continue
             
             # 更新权益曲线
             equity_curve.append(capital)
@@ -510,7 +583,8 @@ class ModelEvaluator:
                 'ProfitFactor': trading_metrics['profit_factor'],
                 'TradeCount': trading_metrics['trade_count'],
                 'Predictions': predictions,
-                'Actuals': y_test
+                'Actuals': y_test,
+                'ActualPrices': mid_price_values  # 新增价格数据
             }
             
             # 添加更多评估指标
@@ -552,6 +626,9 @@ class ModelEvaluator:
         output_dir = "evaluation_plots"
         os.makedirs(output_dir, exist_ok=True)
         
+        # 新增：按天生成交易点价格走势图
+        self._plot_daily_trades(results, output_dir)
+        
         # 1. Confusion Matrix Heatmap with normalized values
         plt.figure(figsize=(10, 8))
         conf_matrix = results['ConfusionMatrix'].values
@@ -571,7 +648,7 @@ class ModelEvaluator:
                 text = f"{conf_matrix[i, j]}\n({norm_conf_matrix[i, j]:.1%})"
                 plt.text(j+0.5, i+0.5, text, ha='center', va='center')
         
-        plt.title('Confusion Matrix', fontsize=14, fontweight='bold')
+        plt.title('Confusion Matrix', fontsize=14)
         plt.xlabel('Predicted Label', fontsize=12)
         plt.ylabel('True Label', fontsize=12)
         plt.tight_layout()
@@ -594,7 +671,7 @@ class ModelEvaluator:
         for i, (count, percentage) in enumerate(zip(class_counts, percentages)):
             ax.text(i, count/2, f"{percentage:.1f}%", ha='center', fontsize=12, color='white', fontweight='bold')
         
-        plt.title('Class Distribution', fontsize=14, fontweight='bold')
+        plt.title('Class Distribution', fontsize=14)
         plt.xlabel('Class', fontsize=12)
         plt.ylabel('Count', fontsize=12)
         plt.xticks(range(3), ['Down', 'Neutral', 'Up'], fontsize=10)
@@ -627,7 +704,7 @@ class ModelEvaluator:
         plt.axvline(x=max_probs.mean(), color='green', linestyle='-', linewidth=2,
                    label=f"Mean: {max_probs.mean():.3f}")
         
-        plt.title('Prediction Confidence Distribution', fontsize=14, fontweight='bold')
+        plt.title('Prediction Confidence Distribution', fontsize=14)
         plt.xlabel('Maximum Probability', fontsize=12)
         plt.ylabel('Count', fontsize=12)
         plt.legend(fontsize=10)
@@ -669,7 +746,7 @@ class ModelEvaluator:
         for i, acc in enumerate(accuracies):
             ax.text(i, acc/2, f"{acc:.1%}", ha='center', fontsize=12, color='white', fontweight='bold')
         
-        plt.title('Accuracy by Class', fontsize=14, fontweight='bold')
+        plt.title('Accuracy by Class', fontsize=14)
         plt.xlabel('Class', fontsize=12)
         plt.ylabel('Accuracy', fontsize=12)
         plt.xticks(range(3), ['Down', 'Neutral', 'Up'], fontsize=10)
@@ -728,7 +805,7 @@ class ModelEvaluator:
         for i, (x, y, count) in enumerate(zip(bin_centers, bin_accuracies, bin_samples)):
             plt.annotate(f"n={count}", (x, y), xytext=(5, 5), textcoords='offset points')
         
-        plt.title('Confidence vs. Accuracy Analysis', fontsize=14, fontweight='bold')
+        plt.title('Confidence vs. Accuracy Analysis', fontsize=14)
         plt.xlabel('Prediction Confidence', fontsize=12)
         plt.ylabel('Accuracy', fontsize=12)
         plt.xlim(0.33, 1.0)
@@ -772,7 +849,7 @@ class ModelEvaluator:
             plt.figtext(0.15, 0.02, f"Avg Win: {results['AvgWin']:.6f}", ha='left', fontsize=10)
             plt.figtext(0.45, 0.02, f"Avg Loss: {results['AvgLoss']:.6f}", ha='left', fontsize=10)
             
-            plt.title('Trading Performance Metrics', fontsize=14, fontweight='bold')
+            plt.title('Trading Performance Metrics', fontsize=14)
             ax1.set_ylabel('Metric Value', fontsize=12)
             ax1.set_ylim(0, max(2, values[1]) * 1.2)
             plt.grid(axis='y', alpha=0.3)
@@ -781,6 +858,172 @@ class ModelEvaluator:
             plt.close()
         
         logger.info(f"Enhanced evaluation plots saved to {output_dir}/ directory")
+
+    def _plot_daily_trades(self, results, output_dir):
+        """Plot price trend and trading points with profit/loss markers"""
+        try:
+            # Style settings - Update seaborn style usage
+            plt.style.use('seaborn-v0_8')  # Updated style name
+            # Alternatively use seaborn's own style setup:
+            # import seaborn as sns
+            # sns.set_theme(style='whitegrid')
+            
+            plt.rcParams.update({
+                'font.size': 10,
+                'axes.titlesize': 14,
+                'axes.labelsize': 12,
+                'xtick.labelsize': 10,
+                'ytick.labelsize': 10,
+                'grid.alpha': 0.3,
+                'figure.figsize': (20, 10),
+                'figure.dpi': 120
+            })
+            
+            # Get price data
+            prices = results.get('ActualPrices', [])
+            if len(prices) == 0:
+                logger.warning("No price data available for plotting")
+                return
+
+            # Read and preprocess trade log
+            trade_df = pd.read_csv('evaluation_plots/trade_log.csv')
+            if trade_df.empty:
+                logger.warning("No trades recorded")
+                return
+            
+            # Add profit/loss info
+            trade_df['pnl'] = trade_df['return'].apply(
+                lambda x: 'profit' if x > 0 else 'loss'
+            )
+            trade_df['return_pct'] = trade_df['return'] * 100  # Convert to percentage
+
+            # Generate dates
+            try:
+                dates = pd.to_datetime(prices.index).date
+            except Exception as date_err:
+                logger.warning(f"Date conversion error: {date_err}, using generated dates")
+                dates = pd.date_range(start='2024-01-01', periods=len(prices), freq='1min').date
+
+            # Plot for each trading day
+            daily_data = pd.DataFrame({'price': prices, 'date': dates})
+            grouped = daily_data.groupby('date')
+            
+            for date, group in grouped:
+                fig, ax = plt.subplots(figsize=(24, 12))
+                
+                # Create simplified time axis (500ms intervals)
+                data_points = len(group)
+                time_in_mins = np.arange(data_points) * 0.5 / 60  # Convert 500ms to minutes
+                
+                # Create mapping from original index to new time points
+                index_map = {idx: i for i, idx in enumerate(group.index)}
+                
+                # Plot price trend with better visual and simplified time axis
+                ax.plot(time_in_mins, group['price'], 
+                       color='#1f77b4', linewidth=1.5, 
+                       label='Mid Price', zorder=1)
+                
+                # Filter and process day's trades
+                day_trades = trade_df[
+                    (trade_df['entry'].isin(group.index)) & 
+                    (trade_df['exit'].isin(group.index))
+                ].copy()
+                
+                if day_trades.empty:
+                    continue
+                    
+                # Add position duration info
+                day_trades['duration_sec'] = (day_trades['exit'] - day_trades['entry']) * 0.5
+                
+                # Map original indexes to new time points
+                day_trades['entry_time'] = day_trades['entry'].map(lambda x: index_map.get(x, 0) * 0.5 / 60)
+                day_trades['exit_time'] = day_trades['exit'].map(lambda x: index_map.get(x, 0) * 0.5 / 60)
+                
+                # Color settings
+                colors = {
+                    ('long', 'profit'): '#4daf4a',   # Green
+                    ('long', 'loss'): '#e41a1c',      # Red
+                    ('short', 'profit'): '#377eb8',   # Blue
+                    ('short', 'loss'): '#ff7f00'      # Orange
+                }
+                
+                # Plot each trade with new time points
+                for _, trade in day_trades.iterrows():
+                    # Get entry/exit prices
+                    try:
+                        entry_price = group.loc[trade['entry'], 'price']
+                        exit_price = group.loc[trade['exit'], 'price']
+                    except KeyError as e:
+                        logger.warning(f"Missing price data for trade {_}: {e}")
+                        continue
+                    
+                    # Determine trade color
+                    color_key = (trade['type'], trade['pnl'])
+                    line_color = colors.get(color_key, '#999999')
+                    
+                    # Plot trade line with arrow using new time points
+                    ax.plot([trade['entry_time'], trade['exit_time']],
+                           [entry_price, exit_price],
+                           color=line_color, linestyle='--', 
+                           linewidth=1.5, alpha=0.8, zorder=2,
+                           marker='>', markersize=8, 
+                           markevery=[1])
+                    
+                    # Plot entry/exit markers
+                    ax.scatter(trade['entry_time'], entry_price,
+                              color=line_color, s=120,
+                              marker='^' if trade['type'] == 'long' else 'v',
+                              edgecolor='black', linewidth=1.2,
+                              zorder=3, label=f"{trade['type'].title()} {trade['pnl']}")
+                    
+                    # Add return annotation
+                    ax.annotate(f"{trade['return_pct']:.2f}%",
+                               xy=(trade['exit_time'], exit_price),
+                               xytext=(5, 5 if trade['pnl'] == 'profit' else -15),
+                               textcoords='offset points',
+                               color=line_color,
+                               fontsize=9,
+                               arrowprops=dict(arrowstyle='->', color=line_color, alpha=0.6))
+                
+                # Formatting
+                ax.set_title(f'Trading Performance - {date}', pad=20)
+                ax.set_xlabel('Time (minutes from start)', fontsize=12)  # Updated x-axis label
+                ax.set_ylabel('Price', rotation=0, labelpad=20)
+                ax.grid(True)
+                
+                # Create custom legend
+                from matplotlib.lines import Line2D
+                legend_elements = [
+                    Line2D([0], [0], color='#4daf4a', lw=2, label='Profitable Long'),
+                    Line2D([0], [0], color='#e41a1c', lw=2, label='Losing Long'),
+                    Line2D([0], [0], color='#377eb8', lw=2, label='Profitable Short'),
+                    Line2D([0], [0], color='#ff7f00', lw=2, label='Losing Short'),
+                    Line2D([0], [0], marker='^', color='w', label='Long Entry',
+                          markerfacecolor='black', markersize=10),
+                    Line2D([0], [0], marker='v', color='w', label='Short Entry',
+                          markerfacecolor='black', markersize=10)
+                ]
+                ax.legend(handles=legend_elements, 
+                         loc='upper left', 
+                         bbox_to_anchor=(1.01, 1),
+                         frameon=True,
+                         title='Trade Types')
+                
+                # Format x-axis ticks for simplified time
+                ax.xaxis.set_major_locator(plt.MaxNLocator(10))  # Show ~10 tick marks
+                
+                # Save plot
+                filename = f"{output_dir}/daily_trades_{date.strftime('%Y%m%d')}.png"
+                plt.tight_layout()
+                plt.savefig(filename, bbox_inches='tight')
+                plt.close()
+                
+                logger.info(f"Generated enhanced trade plot: {filename}")
+
+        except Exception as e:
+            logger.error(f"Failed to generate trade plots: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     def _generate_volatility_analysis(self, results, output_dir):
         """分析不同波动率水平下的预测表现"""
