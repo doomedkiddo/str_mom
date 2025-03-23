@@ -31,7 +31,8 @@ class SignalData(Structure):
         ("action", c_char * 8),
         ("orderId", c_long),
         ("clientOrderId", c_char * 32),
-        ("with_tp_sl", c_bool)
+        ("with_tp", c_bool),
+        ("with_sl", c_bool)
     ]
 
 class ShmHeader(Structure):
@@ -44,7 +45,7 @@ class ShmHeader(Structure):
 
 # Add order sending function from signal_generator.py
 def send_order_signal(symbol, action, side="", order_type="", quantity=0.0, price=0.0, 
-                     order_id=0, client_order_id="", with_tp_sl=False):
+                     order_id=0, client_order_id="", with_tp=False, with_sl=False):
     try:
         # Open shared memory
         shm_fd = os.open('/dev/shm/binance_signals', os.O_RDWR)
@@ -67,7 +68,8 @@ def send_order_signal(symbol, action, side="", order_type="", quantity=0.0, pric
             action=action.encode('utf-8'),
             orderId=order_id,
             clientOrderId=client_order_id.encode('utf-8'),
-            with_tp_sl=with_tp_sl
+            with_tp=with_tp,
+            with_sl=with_sl
         )
         
         # Calculate position for new signal
@@ -720,7 +722,8 @@ class OrderBookPredictor:
                 price=price,
                 action="NEW",
                 client_order_id=client_order_id,
-                with_tp_sl=True  # Enable TP/SL for automatic trading
+                with_tp=True,  # Enable TP/SL for automatic trading
+                with_sl=True,
             )
             
             # Track this order
@@ -994,7 +997,7 @@ def main():
     parser.add_argument('--zmq_address', type=str, default='tcp://localhost:5555', help='ZMQ socket address')
     parser.add_argument('--save_interval', type=int, default=3600, help='Data save interval in seconds')
     parser.add_argument('--threshold', type=float, default=0.3, help='Confidence threshold for trading signals')
-    parser.add_argument('--symbol', type=str, default='DOGEUSDT', help='Trading symbol')
+    parser.add_argument('--symbol', type=str, default='SOLUSDT', help='Trading symbol')
     parser.add_argument('--order_size', type=float, default=10.0, help='Order size in USDT')
     parser.add_argument('--test', type=str, help='Test mode: provide path to feather file')
     args = parser.parse_args()
