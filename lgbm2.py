@@ -155,8 +155,8 @@ def create_features(data_chunk, window_size=1800):
                                       data_chunk['mid_price']) / data_chunk['mid_price']
     
     # 考虑放宽阈值以生成更多信号
-    LOWER_THRESHOLD = -0.0003  # -0.03%
-    UPPER_THRESHOLD = 0.0003   # +0.03%
+    LOWER_THRESHOLD = -0.0005  # -0.05%
+    UPPER_THRESHOLD = 0.0005   # +0.05%
 
     conditions = [
         (data_chunk['price_change_rate'] < LOWER_THRESHOLD),
@@ -318,20 +318,20 @@ def create_features(data_chunk, window_size=1800):
                                 data_chunk['ofi'].rolling(30).mean())
     
     # Add stronger directional signals
-    data_chunk['price_acceleration'] = data_chunk['price_momentum'].diff()
-    data_chunk['momentum_divergence'] = data_chunk['price_momentum'] - data_chunk['price_momentum'].rolling(120).mean()
+    # data_chunk['price_acceleration'] = data_chunk['price_momentum'].diff()
+    # data_chunk['momentum_divergence'] = data_chunk['price_momentum'] - data_chunk['price_momentum'].rolling(120).mean()
     
-    # Add breakout detection features
-    data_chunk['volatility_breakout'] = data_chunk['volatility_1min'] > data_chunk['volatility_5min'] * 1.5
-    data_chunk['range_breakout'] = (data_chunk['price_momentum'].abs() > 
-                                   data_chunk['price_momentum'].rolling(300).std() * 2)
+    # # Add breakout detection features
+    # data_chunk['volatility_breakout'] = data_chunk['volatility_1min'] > data_chunk['volatility_5min'] * 1.5
+    # data_chunk['range_breakout'] = (data_chunk['price_momentum'].abs() > 
+    #                                data_chunk['price_momentum'].rolling(300).std() * 2)
     
-    # Add market regime features that identify trending vs ranging markets
-    data_chunk['trending_market'] = (data_chunk['price_momentum_5min'].abs() > 
-                                    data_chunk['volatility_5min'] * 1.2)
+    # # Add market regime features that identify trending vs ranging markets
+    # data_chunk['trending_market'] = (data_chunk['price_momentum_5min'].abs() > 
+    #                                 data_chunk['volatility_5min'] * 1.2)
     
-    # Add order flow imbalance features
-    data_chunk['buy_sell_imbalance'] = data_chunk['flow_toxicity'].rolling(60).mean() / data_chunk['vpin']
+    # # Add order flow imbalance features
+    # data_chunk['buy_sell_imbalance'] = data_chunk['flow_toxicity'].rolling(60).mean() / data_chunk['vpin']
     
     # 最后删除mid_price副本
     del mid_price_copy
@@ -531,9 +531,9 @@ def compute_sample_weights(y):
     class_counts = np.bincount(y.astype(int))
     # Increase weights for classes 0 and 2 (down and up)
     class_weights = {
-        0: 1.2 * (class_counts[1] / class_counts[0]),  # Double weight for down class
+        0: 1.05 * (class_counts[1] / class_counts[0]),  # Double weight for down class
         1: 1.0,  # Neutral class gets standard weight
-        2: 1.2 * (class_counts[1] / class_counts[2])   # Double weight for up class
+        2: 1.05 * (class_counts[1] / class_counts[2])   # Double weight for up class
     }
     return np.array([class_weights[int(yi)] for yi in y])
 

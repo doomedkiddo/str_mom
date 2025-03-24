@@ -613,6 +613,13 @@ class OrderBookPredictor:
                     self.valid_updates += 1
                     timestamp = datetime.fromtimestamp(data['timestamp'] / 1e9)
                     
+                    # Store the raw order book data for later use
+                    self.last_order_book_data = {
+                        'bids': data['bids'],
+                        'asks': data['asks'],
+                        'timestamp': data['timestamp']
+                    }
+                    
                     # Store recent messages (with best bid/ask prices)
                     self.recent_messages.append({
                         'timestamp': timestamp,
@@ -688,7 +695,7 @@ class OrderBookPredictor:
                 logger.error(f"Error processing message: {e}")
                 logger.exception("Error details:")
 
-    def place_order(self, action, price):
+    def place_order(self, action, price, order_book=None):
         """Place a limit order based on prediction signal"""
         try:
             # Determine order side based on action
@@ -703,46 +710,137 @@ class OrderBookPredictor:
             # Get symbol precision requirements
             qty_precision, price_precision = self.get_symbol_precision(self.trading_symbol)
             
-            # Calculate quantity based on fixed USDT amount and round to correct precision
-            quantity = round(self.order_quantity_usdt / price, qty_precision)
-            
-            # Round price to correct precision
-            price = round(price, price_precision)
-            
-            # Generate a unique client order ID
-            client_order_id = f"pred_{uuid.uuid4().hex[:16]}"
-            
-            # Place the order
-            logger.info(f"Placing a {side} limit order for {quantity:.4f} {self.trading_symbol} at {price:.4f} with TP/SL...")
-            send_order_signal(
-                symbol=self.trading_symbol,
-                side=side,
-                order_type="LIMIT",
-                quantity=quantity,
-                price=price,
-                action="NEW",
-                client_order_id=client_order_id,
-                with_tp=True,  # Enable TP/SL for automatic trading
-                with_sl=True,
-            )
-            
-            # Track this order
-            self.active_orders[client_order_id] = {
-                'symbol': self.trading_symbol,
-                'side': side,
-                'price': price,
-                'quantity': quantity,
-                'timestamp': datetime.now(),
-                'with_tp_sl': True
-            }
-            
-            return client_order_id
+            # Determine order price based on order book levels instead of current price
+            # For BUY orders, use the 2nd and 3rd bid levels
+            # For SELL orders, use the 2nd and 3rd ask levels
+            if order_book and len(order_book.get('bids', [])) >= 3 and len(order_book.get('asks', [])) >= 3:
+                if side == 'BUY':
+                    # Use bid price levels (2nd and 3rd) for buy orders
+                    # This places buy orders below the current best bid
+                    order_price_2nd = order_book['bids'][1]['price']
+                    order_price_3rd = order_book['bids'][2]['price']
+                    logger.info(f"Using 2nd bid price level: {order_price_2nd} and 3rd: {order_price_3rd}")
+                else:  # SELL
+                    # Use ask price levels (2nd and 3rd) for sell orders
+                    # This places sell orders above the current best ask
+                    order_price_2nd = order_book['asks'][1]['price']
+                    order_price_3rd = order_book['asks'][2]['price']
+                    logger.info(f"Using 2nd ask price level: {order_price_2nd} and 3rd: {order_price_3rd}")
+                
+                # Place two orders: one at level 2 and one at level 3
+                orders_placed = []
+                
+                # Place first order at level 2
+                price_2nd = round(order_price_2nd, price_precision)
+                quantity_2nd = round(self.order_quantity_usdt / 2 / price_2nd, qty_precision)  # Half the quantity
+                
+                # Generate a unique client order ID for first order
+                client_order_id_2nd = f"pred_2nd_{uuid.uuid4().hex[:16]}"
+                
+                # Place the first order (level 2)
+                logger.info(f"Placing a {side} limit order for {quantity_2nd:.4f} {self.trading_symbol} at {price_2nd:.4f} (2nd level) with TP/SL...")
+                send_order_signal(
+                    symbol=self.trading_symbol,
+                    side=side,
+                    order_type="LIMIT",
+                    quantity=quantity_2nd,
+                    price=price_2nd,
+                    action="NEW",
+                    client_order_id=client_order_id_2nd,
+                    with_tp=True,  # Enable TP/SL for automatic trading
+                    with_sl=True,
+                )
+                
+                # Track this order
+                self.active_orders[client_order_id_2nd] = {
+                    'symbol': self.trading_symbol,
+                    'side': side,
+                    'price': price_2nd,
+                    'quantity': quantity_2nd,
+                    'timestamp': datetime.now(),
+                    'with_tp_sl': True,
+                    'level': '2nd'
+                }
+                orders_placed.append(client_order_id_2nd)
+                
+                # Place second order at level 3
+                price_3rd = round(order_price_3rd, price_precision)
+                quantity_3rd = round(self.order_quantity_usdt / 2 / price_3rd, qty_precision)  # Half the quantity
+                
+                # Generate a unique client order ID for second order
+                client_order_id_3rd = f"pred_3rd_{uuid.uuid4().hex[:16]}"
+                
+                # Place the second order (level 3)
+                logger.info(f"Placing a {side} limit order for {quantity_3rd:.4f} {self.trading_symbol} at {price_3rd:.4f} (3rd level) with TP/SL...")
+                send_order_signal(
+                    symbol=self.trading_symbol,
+                    side=side,
+                    order_type="LIMIT",
+                    quantity=quantity_3rd,
+                    price=price_3rd,
+                    action="NEW",
+                    client_order_id=client_order_id_3rd,
+                    with_tp=True,  # Enable TP/SL for automatic trading
+                    with_sl=True,
+                )
+                
+                # Track this order
+                self.active_orders[client_order_id_3rd] = {
+                    'symbol': self.trading_symbol,
+                    'side': side,
+                    'price': price_3rd,
+                    'quantity': quantity_3rd,
+                    'timestamp': datetime.now(),
+                    'with_tp_sl': True,
+                    'level': '3rd'
+                }
+                orders_placed.append(client_order_id_3rd)
+                
+                return orders_placed
+            else:
+                # Fallback to original logic if order book data is not available or insufficient
+                logger.warning("Insufficient order book levels, using current price")
+                
+                # Calculate quantity based on fixed USDT amount and round to correct precision
+                quantity = round(self.order_quantity_usdt / price, qty_precision)
+                
+                # Round price to correct precision
+                price = round(price, price_precision)
+                
+                # Generate a unique client order ID
+                client_order_id = f"pred_{uuid.uuid4().hex[:16]}"
+                
+                # Place the order
+                logger.info(f"Placing a {side} limit order for {quantity:.4f} {self.trading_symbol} at {price:.4f} with TP/SL...")
+                send_order_signal(
+                    symbol=self.trading_symbol,
+                    side=side,
+                    order_type="LIMIT",
+                    quantity=quantity,
+                    price=price,
+                    action="NEW",
+                    client_order_id=client_order_id,
+                    with_tp=True,  # Enable TP/SL for automatic trading
+                    with_sl=True,
+                )
+                
+                # Track this order
+                self.active_orders[client_order_id] = {
+                    'symbol': self.trading_symbol,
+                    'side': side,
+                    'price': price,
+                    'quantity': quantity,
+                    'timestamp': datetime.now(),
+                    'with_tp_sl': True
+                }
+                
+                return [client_order_id]
             
         except Exception as e:
             logger.error(f"Error placing order: {e}")
             logger.exception("Order placement error details:")
             return None
-            
+
     def cancel_all_orders(self):
         """Cancel all active orders"""
         for client_order_id in list(self.active_orders.keys()):
@@ -794,13 +892,30 @@ class OrderBookPredictor:
                 
                 # 只在产生实际交易信号时执行交易操作
                 if signal['action'] != 'HOLD':
-                    # Place order at mid price
-                    client_order_id = self.place_order(signal['action'], current_price)
+                    # Get current order book data to pass to place_order
+                    order_book = None
+                    # Try to get the latest order book data from the most recent message
+                    if len(self.recent_messages) > 0:
+                        # Extract the raw order book data from the most recent ZMQ message
+                        try:
+                            # Since we don't have direct access to the raw order book data,
+                            # we need to reconstruct it from the latest data window entry
+                            if len(self.data_window) > 0:
+                                latest_data = self.data_window[-1]
+                                # In a real implementation, we need to access the raw order book
+                                # Here we'll check if there's a valid ZMQ message stored somewhere
+                                # This is a placeholder - the actual implementation depends on how the data is stored
+                                order_book = self._get_latest_order_book()
+                        except Exception as e:
+                            logger.error(f"Failed to get order book data: {e}")
                     
-                    if client_order_id:
-                        # Add order ID to the signal for reference
-                        signal['client_order_id'] = client_order_id
-                        logger.info(f"Order placed with client ID: {client_order_id}")
+                    # Place orders at level 2 and 3 instead of mid price
+                    client_order_ids = self.place_order(signal['action'], current_price, order_book)
+                    
+                    if client_order_ids:
+                        # Add order IDs to the signal for reference
+                        signal['client_order_ids'] = client_order_ids
+                        logger.info(f"Orders placed with client IDs: {client_order_ids}")
                     
                     # Add to trade log only actual trades
                     self.trade_log.append(signal)
@@ -811,7 +926,23 @@ class OrderBookPredictor:
             logger.error(f"Error making prediction: {e}")
             logger.exception("Prediction error details:")
             return None
-    
+            
+    def _get_latest_order_book(self):
+        """Helper method to get the latest order book data"""
+        # This method should be implemented based on how order book data is stored in your system
+        try:
+            if hasattr(self, 'last_order_book_data'):
+                return self.last_order_book_data
+            
+            # If direct access to the order book is not available, try to reconstruct from data_window
+            if len(self.data_window) > 0:
+                # For this implementation, we'll return a simplified structure
+                # In a real system, you'd need to extract or retrieve the full order book
+                return None
+        except Exception as e:
+            logger.error(f"Error retrieving order book data: {e}")
+            return None
+
     def stop(self):
         """Stop the predictor and clean up resources"""
         self.running = False
@@ -850,7 +981,7 @@ class OrderBookPredictor:
             'BTCUSDT': (5, 2),
             'ETHUSDT': (4, 2),
             'BNBUSDT': (3, 4),
-            'SOLUSDT': (2, 4)
+            'SOLUSDT': (2, 2)
         }
         return precision_map.get(symbol, (3, 5))  # Default to 3 qty decimals, 5 price decimals
 
